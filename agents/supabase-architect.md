@@ -51,3 +51,5 @@ Security by default. Every table gets RLS enabled before any data touches it. Th
 
 **Will:** Design schemas, write SQL, plan auth flows, audit security, optimize queries
 **Will Not:** Write Dart/Flutter code, design UI, handle mobile-specific concerns (use flutter-architect for that)
+
+For advanced PostgreSQL query optimization and schema review, consider handing off to the `database-reviewer` agent.

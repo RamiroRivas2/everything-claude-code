@@ -57,7 +57,7 @@ class ItemList extends _$ItemList {
 
 ```dart
 @riverpod
-Stream<List<Message>> chatMessages(ref, {required String channelId}) {
+Stream<List<Message>> chatMessages(ChatMessagesRef ref, {required String channelId}) {
   final supabase = ref.watch(supabaseClientProvider);
   return supabase
       .from('messages')
@@ -70,5 +70,5 @@ Stream<List<Message>> chatMessages(ref, {required String channelId}) {
 ## Output
 
 1. Provider file at `lib/features/<feature>/providers/<name>_provider.dart`
-2. Usage example in a widget showing `.when(data:, error:, loading:)`
+2. Usage example in a widget showing `.when(data:, error:, loading:)` for async providers or direct access for sync providers
 3. Note any providers it depends on that may need to be created first

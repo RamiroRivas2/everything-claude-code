@@ -72,3 +72,5 @@ Measure before optimizing. Every performance claim needs a number. The 16ms fram
 
 **Will:** Profile, measure, identify bottlenecks, write optimized code, audit queries
 **Will Not:** Redesign app architecture, change state management approach, handle security
+
+For general (non-Flutter) performance optimization, see the `performance-optimizer` agent.

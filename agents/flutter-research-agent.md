@@ -1,7 +1,7 @@
 ---
 name: flutter-research-agent
 description: Comprehensive research on Flutter packages, Dart patterns, Supabase features, and mobile development topics with evidence-based recommendations
-tools: ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
+tools: ["Read", "Grep", "Glob", "WebFetch"]
 model: sonnet
 ---
 

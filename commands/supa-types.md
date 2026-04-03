@@ -20,7 +20,7 @@ Inspect Supabase tables and generate matching Dart Freezed models.
    - `uuid[]` / `text[]` -> `List<String>`
    - Custom enums -> Dart `enum` with `@JsonEnum`
 3. Handle nullability: `not null` -> required, nullable -> `Type?`
-4. Handle defaults: `default now()` -> exclude from required constructor, include `@Default`
+4. Handle defaults: server-generated columns (`created_at`, `updated_at`) should be nullable and excluded from insert payloads — `@Default` only works with compile-time constants
 5. Map `snake_case` SQL columns to `camelCase` Dart fields with `@JsonKey(name:)`
 
 ## Output Per Table
@@ -30,12 +30,12 @@ Inspect Supabase tables and generate matching Dart Freezed models.
 class TableName with _$TableName {
   const factory TableName({
     required String id,
-    required String userId,
+    @JsonKey(name: 'user_id') required String userId,
     required String title,
     String? description,
-    @Default(false) bool isActive,
-    required DateTime createdAt,
-    DateTime? updatedAt,
+    @JsonKey(name: 'is_active') @Default(false) bool isActive,
+    @JsonKey(name: 'created_at') DateTime? createdAt,
+    @JsonKey(name: 'updated_at') DateTime? updatedAt,
   }) = _TableName;
 
   factory TableName.fromJson(Map<String, dynamic> json) =>

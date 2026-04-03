@@ -73,7 +73,10 @@ These ECC resources complement the toolkit:
 
 ## Supabase MCP
 
-ECC includes a Supabase MCP server config in `mcp-configs/mcp-servers.json`. To connect Claude Code directly to your Supabase project, configure the `SUPABASE_ACCESS_TOKEN` and project ref in your environment.
+ECC includes a Supabase MCP server config in `mcp-configs/mcp-servers.json`. To connect Claude Code to your Supabase project:
+
+1. Set `SUPABASE_ACCESS_TOKEN` in your environment
+2. Update the `--project-ref` flag in the MCP config with your project reference
 
 ## Upstream Compatibility
 
