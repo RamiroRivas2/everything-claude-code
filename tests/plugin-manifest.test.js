@@ -68,6 +68,7 @@ function assertSafeRepoRelativePath(relativePath, label) {
 console.log('\n=== .claude-plugin/plugin.json ===\n');
 
 const claudePluginPath = path.join(repoRoot, '.claude-plugin', 'plugin.json');
+const claudeMarketplacePath = path.join(repoRoot, '.claude-plugin', 'marketplace.json');
 
 test('claude plugin.json exists', () => {
   assert.ok(fs.existsSync(claudePluginPath), 'Expected .claude-plugin/plugin.json to exist');
@@ -77,6 +78,10 @@ const claudePlugin = loadJsonObject(claudePluginPath, '.claude-plugin/plugin.jso
 
 test('claude plugin.json has version field', () => {
   assert.ok(claudePlugin.version, 'Expected version field');
+});
+
+test('claude plugin.json uses short plugin slug', () => {
+  assert.strictEqual(claudePlugin.name, 'ecc');
 });
 
 test('claude plugin.json agents is an array', () => {
@@ -127,6 +132,30 @@ test('claude plugin.json does NOT have explicit hooks declaration', () => {
   );
 });
 
+console.log('\n=== .claude-plugin/marketplace.json ===\n');
+
+test('claude marketplace.json exists', () => {
+  assert.ok(fs.existsSync(claudeMarketplacePath), 'Expected .claude-plugin/marketplace.json to exist');
+});
+
+const claudeMarketplace = loadJsonObject(claudeMarketplacePath, '.claude-plugin/marketplace.json');
+
+test('claude marketplace.json keeps only Claude-supported top-level keys', () => {
+  const unsupportedTopLevelKeys = ['$schema', 'description'];
+  for (const key of unsupportedTopLevelKeys) {
+    assert.ok(
+      !(key in claudeMarketplace),
+      `.claude-plugin/marketplace.json must not declare unsupported top-level key "${key}"`,
+    );
+  }
+});
+
+test('claude marketplace.json has plugins array with a short ecc plugin entry', () => {
+  assert.ok(Array.isArray(claudeMarketplace.plugins) && claudeMarketplace.plugins.length > 0, 'Expected plugins array');
+  assert.strictEqual(claudeMarketplace.name, 'ecc');
+  assert.strictEqual(claudeMarketplace.plugins[0].name, 'ecc');
+});
+
 // ── Codex plugin manifest ─────────────────────────────────────────────────────
 // Per official docs: https://platform.openai.com/docs/codex/plugins
 // - .codex-plugin/plugin.json is the required manifest
@@ -144,6 +173,10 @@ const codexPlugin = loadJsonObject(codexPluginPath, '.codex-plugin/plugin.json')
 
 test('codex plugin.json has name field', () => {
   assert.ok(codexPlugin.name, 'Expected name field');
+});
+
+test('codex plugin.json uses short plugin slug', () => {
+  assert.strictEqual(codexPlugin.name, 'ecc');
 });
 
 test('codex plugin.json has version field', () => {
@@ -240,6 +273,10 @@ test('marketplace.json has name field', () => {
   assert.ok(marketplace.name, 'Expected name field');
 });
 
+test('marketplace.json uses short marketplace slug', () => {
+  assert.strictEqual(marketplace.name, 'ecc');
+});
+
 test('marketplace.json has plugins array with at least one entry', () => {
   assert.ok(Array.isArray(marketplace.plugins) && marketplace.plugins.length > 0, 'Expected plugins array');
 });
@@ -251,6 +288,10 @@ test('marketplace.json plugin entries have required fields', () => {
     assert.ok(plugin.policy && plugin.policy.installation, `Plugin "${plugin.name}" missing policy.installation`);
     assert.ok(plugin.category, `Plugin "${plugin.name}" missing category`);
   }
+});
+
+test('marketplace.json plugin entry uses short plugin slug', () => {
+  assert.strictEqual(marketplace.plugins[0].name, 'ecc');
 });
 
 test('marketplace local plugin path resolves to the repo-root Codex bundle', () => {
