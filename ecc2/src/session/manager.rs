@@ -1,19 +1,24 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
+use cron::Schedule as CronSchedule;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::str::FromStr;
 use tokio::process::Command;
 
 use super::output::SessionOutputStore;
 use super::runtime::capture_command_output;
 use super::store::StateStore;
 use super::{
-    default_project_label, default_task_group_label, normalize_group_label, Session,
-    SessionAgentProfile, SessionGrouping, SessionHarnessInfo, SessionMetrics, SessionState,
+    default_project_label, default_task_group_label, normalize_group_label, HarnessKind,
+    RemoteDispatchKind, ScheduledTask, Session, SessionAgentProfile, SessionGrouping,
+    SessionHarnessInfo, SessionMetrics, SessionState,
 };
-use crate::comms::{self, MessageType};
+use crate::comms::{self, MessageType, TaskPriority};
 use crate::config::Config;
 use crate::observability::{log_tool_call, ToolCallEvent, ToolLogEntry, ToolLogPage, ToolLogger};
 use crate::worktree;
@@ -108,11 +113,53 @@ pub async fn create_session_from_source_with_profile_and_grouping(
     .await
 }
 
+async fn run_due_schedules_with_runner_program(
+    db: &StateStore,
+    cfg: &Config,
+    limit: usize,
+    runner_program: &Path,
+) -> Result<Vec<ScheduledRunOutcome>> {
+    let now = Utc::now();
+    let schedules = db.list_due_scheduled_tasks(now, limit)?;
+    let mut outcomes = Vec::new();
+
+    for schedule in schedules {
+        let grouping = SessionGrouping {
+            project: normalize_group_label(&schedule.project),
+            task_group: normalize_group_label(&schedule.task_group),
+        };
+        let session_id = queue_session_in_dir_with_runner_program(
+            db,
+            cfg,
+            &schedule.task,
+            &schedule.agent_type,
+            schedule.use_worktree,
+            &schedule.working_dir,
+            runner_program,
+            schedule.profile_name.as_deref(),
+            None,
+            grouping,
+        )
+        .await?;
+        let next_run_at = next_schedule_run_at(&schedule.cron_expr, now)?;
+        db.record_scheduled_task_run(schedule.id, now, next_run_at)?;
+        outcomes.push(ScheduledRunOutcome {
+            schedule_id: schedule.id,
+            session_id,
+            task: schedule.task,
+            cron_expr: schedule.cron_expr,
+            next_run_at,
+        });
+    }
+
+    Ok(outcomes)
+}
+
 pub fn list_sessions(db: &StateStore) -> Result<Vec<Session>> {
     db.list_sessions()
 }
 
-pub fn get_status(db: &StateStore, id: &str) -> Result<SessionStatus> {
+pub fn get_status(db: &StateStore, cfg: &Config, id: &str) -> Result<SessionStatus> {
     let session = resolve_session(db, id)?;
     let session_id = session.id.clone();
     Ok(SessionStatus {
@@ -120,7 +167,8 @@ pub fn get_status(db: &StateStore, id: &str) -> Result<SessionStatus> {
             .get_session_harness_info(&session_id)?
             .unwrap_or_else(|| {
                 SessionHarnessInfo::detect(&session.agent_type, &session.working_dir)
-            }),
+            })
+            .with_config_detection(cfg, &session.working_dir),
         profile: db.get_session_profile(&session_id)?,
         session,
         parent_session: db.latest_task_handoff_source(&session_id)?,
@@ -153,6 +201,390 @@ pub fn get_team_status(db: &StateStore, id: &str, depth: usize) -> Result<TeamSt
         handoff_backlog,
         descendants,
     })
+}
+
+pub fn create_scheduled_task(
+    db: &StateStore,
+    cfg: &Config,
+    cron_expr: &str,
+    task: &str,
+    agent_type: &str,
+    profile_name: Option<&str>,
+    use_worktree: bool,
+    grouping: SessionGrouping,
+) -> Result<ScheduledTask> {
+    let working_dir =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    let project = grouping
+        .project
+        .as_deref()
+        .and_then(normalize_group_label)
+        .unwrap_or_else(|| default_project_label(&working_dir));
+    let task_group = grouping
+        .task_group
+        .as_deref()
+        .and_then(normalize_group_label)
+        .unwrap_or_else(|| default_task_group_label(task));
+    let agent_type = HarnessKind::canonical_agent_type(agent_type);
+
+    if let Some(profile_name) = profile_name {
+        cfg.resolve_agent_profile(profile_name)?;
+    }
+
+    let next_run_at = next_schedule_run_at(cron_expr, Utc::now())?;
+    db.insert_scheduled_task(
+        cron_expr,
+        task,
+        &agent_type,
+        profile_name,
+        &working_dir,
+        &project,
+        &task_group,
+        use_worktree,
+        next_run_at,
+    )
+}
+
+pub fn list_scheduled_tasks(db: &StateStore) -> Result<Vec<ScheduledTask>> {
+    db.list_scheduled_tasks()
+}
+
+pub fn delete_scheduled_task(db: &StateStore, schedule_id: i64) -> Result<bool> {
+    Ok(db.delete_scheduled_task(schedule_id)? > 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_remote_dispatch_request(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    target_session_id: Option<&str>,
+    priority: TaskPriority,
+    agent_type: &str,
+    profile_name: Option<&str>,
+    use_worktree: bool,
+    grouping: SessionGrouping,
+    source: &str,
+    requester: Option<&str>,
+) -> Result<super::RemoteDispatchRequest> {
+    let working_dir =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    create_remote_dispatch_request_inner(
+        db,
+        cfg,
+        RemoteDispatchKind::Standard,
+        &working_dir,
+        task,
+        None,
+        target_session_id,
+        priority,
+        agent_type,
+        profile_name,
+        use_worktree,
+        grouping,
+        source,
+        requester,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_computer_use_remote_dispatch_request(
+    db: &StateStore,
+    cfg: &Config,
+    goal: &str,
+    target_url: Option<&str>,
+    context: Option<&str>,
+    target_session_id: Option<&str>,
+    priority: TaskPriority,
+    agent_type_override: Option<&str>,
+    profile_name_override: Option<&str>,
+    use_worktree_override: Option<bool>,
+    grouping: SessionGrouping,
+    source: &str,
+    requester: Option<&str>,
+) -> Result<super::RemoteDispatchRequest> {
+    let working_dir =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    create_computer_use_remote_dispatch_request_in_dir(
+        db,
+        cfg,
+        &working_dir,
+        goal,
+        target_url,
+        context,
+        target_session_id,
+        priority,
+        agent_type_override,
+        profile_name_override,
+        use_worktree_override,
+        grouping,
+        source,
+        requester,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_computer_use_remote_dispatch_request_in_dir(
+    db: &StateStore,
+    cfg: &Config,
+    working_dir: &Path,
+    goal: &str,
+    target_url: Option<&str>,
+    context: Option<&str>,
+    target_session_id: Option<&str>,
+    priority: TaskPriority,
+    agent_type_override: Option<&str>,
+    profile_name_override: Option<&str>,
+    use_worktree_override: Option<bool>,
+    grouping: SessionGrouping,
+    source: &str,
+    requester: Option<&str>,
+) -> Result<super::RemoteDispatchRequest> {
+    let defaults = cfg.computer_use_dispatch_defaults();
+    let task = render_computer_use_task(goal, target_url, context);
+    let agent_type = agent_type_override.unwrap_or(&defaults.agent);
+    let profile_name = profile_name_override.or(defaults.profile.as_deref());
+    let use_worktree = use_worktree_override.unwrap_or(defaults.use_worktree);
+    let grouping = SessionGrouping {
+        project: grouping.project.or(defaults.project),
+        task_group: grouping
+            .task_group
+            .or(defaults.task_group)
+            .or_else(|| Some(default_task_group_label(goal))),
+    };
+
+    create_remote_dispatch_request_inner(
+        db,
+        cfg,
+        RemoteDispatchKind::ComputerUse,
+        working_dir,
+        &task,
+        target_url,
+        target_session_id,
+        priority,
+        agent_type,
+        profile_name,
+        use_worktree,
+        grouping,
+        source,
+        requester,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_remote_dispatch_request_inner(
+    db: &StateStore,
+    cfg: &Config,
+    request_kind: RemoteDispatchKind,
+    working_dir: &Path,
+    task: &str,
+    target_url: Option<&str>,
+    target_session_id: Option<&str>,
+    priority: TaskPriority,
+    agent_type: &str,
+    profile_name: Option<&str>,
+    use_worktree: bool,
+    grouping: SessionGrouping,
+    source: &str,
+    requester: Option<&str>,
+) -> Result<super::RemoteDispatchRequest> {
+    let project = grouping
+        .project
+        .as_deref()
+        .and_then(normalize_group_label)
+        .unwrap_or_else(|| default_project_label(&working_dir));
+    let task_group = grouping
+        .task_group
+        .as_deref()
+        .and_then(normalize_group_label)
+        .unwrap_or_else(|| default_task_group_label(task));
+    let agent_type = HarnessKind::canonical_agent_type(agent_type);
+
+    if let Some(profile_name) = profile_name {
+        cfg.resolve_agent_profile(profile_name)?;
+    }
+    if let Some(target_session_id) = target_session_id {
+        let _ = resolve_session(db, target_session_id)?;
+    }
+
+    db.insert_remote_dispatch_request(
+        request_kind,
+        target_session_id,
+        task,
+        target_url,
+        priority,
+        &agent_type,
+        profile_name,
+        &working_dir,
+        &project,
+        &task_group,
+        use_worktree,
+        source,
+        requester,
+    )
+}
+
+fn render_computer_use_task(goal: &str, target_url: Option<&str>, context: Option<&str>) -> String {
+    let mut lines = vec![
+        "Computer-use task.".to_string(),
+        format!("Goal: {}", goal.trim()),
+    ];
+    if let Some(target_url) = target_url.map(str::trim).filter(|value| !value.is_empty()) {
+        lines.push(format!("Target URL: {target_url}"));
+    }
+    if let Some(context) = context.map(str::trim).filter(|value| !value.is_empty()) {
+        lines.push(format!("Context: {context}"));
+    }
+    lines.push(
+        "Use browser or computer-use tools directly when available, and report blockers clearly if auth, approvals, or local-device access prevent completion."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+pub fn list_remote_dispatch_requests(
+    db: &StateStore,
+    include_processed: bool,
+    limit: usize,
+) -> Result<Vec<super::RemoteDispatchRequest>> {
+    db.list_remote_dispatch_requests(include_processed, limit)
+}
+
+pub async fn run_due_schedules(
+    db: &StateStore,
+    cfg: &Config,
+    limit: usize,
+) -> Result<Vec<ScheduledRunOutcome>> {
+    let runner_program =
+        std::env::current_exe().context("Failed to resolve ECC executable path")?;
+    run_due_schedules_with_runner_program(db, cfg, limit, &runner_program).await
+}
+
+pub async fn run_remote_dispatch_requests(
+    db: &StateStore,
+    cfg: &Config,
+    limit: usize,
+) -> Result<Vec<RemoteDispatchOutcome>> {
+    let requests = db.list_pending_remote_dispatch_requests(limit)?;
+    let runner_program =
+        std::env::current_exe().context("Failed to resolve ECC executable path")?;
+    run_remote_dispatch_requests_with_runner_program(db, cfg, requests, &runner_program).await
+}
+
+async fn run_remote_dispatch_requests_with_runner_program(
+    db: &StateStore,
+    cfg: &Config,
+    requests: Vec<super::RemoteDispatchRequest>,
+    runner_program: &Path,
+) -> Result<Vec<RemoteDispatchOutcome>> {
+    let mut outcomes = Vec::new();
+
+    for request in requests {
+        let grouping = SessionGrouping {
+            project: normalize_group_label(&request.project),
+            task_group: normalize_group_label(&request.task_group),
+        };
+
+        let outcome = if let Some(target_session_id) = request.target_session_id.as_deref() {
+            match assign_session_in_dir_with_runner_program(
+                db,
+                cfg,
+                target_session_id,
+                &request.task,
+                &request.agent_type,
+                request.use_worktree,
+                &request.working_dir,
+                &runner_program,
+                request.profile_name.as_deref(),
+                grouping,
+            )
+            .await
+            {
+                Ok(assignment) if assignment.action == AssignmentAction::DeferredSaturated => {
+                    RemoteDispatchOutcome {
+                        request_id: request.id,
+                        task: request.task.clone(),
+                        priority: request.priority,
+                        target_session_id: request.target_session_id.clone(),
+                        session_id: None,
+                        action: RemoteDispatchAction::DeferredSaturated,
+                    }
+                }
+                Ok(assignment) => {
+                    db.record_remote_dispatch_success(
+                        request.id,
+                        Some(&assignment.session_id),
+                        Some(assignment.action.label()),
+                    )?;
+                    RemoteDispatchOutcome {
+                        request_id: request.id,
+                        task: request.task.clone(),
+                        priority: request.priority,
+                        target_session_id: request.target_session_id.clone(),
+                        session_id: Some(assignment.session_id),
+                        action: RemoteDispatchAction::Assigned(assignment.action),
+                    }
+                }
+                Err(error) => {
+                    db.record_remote_dispatch_failure(request.id, &error.to_string())?;
+                    RemoteDispatchOutcome {
+                        request_id: request.id,
+                        task: request.task.clone(),
+                        priority: request.priority,
+                        target_session_id: request.target_session_id.clone(),
+                        session_id: None,
+                        action: RemoteDispatchAction::Failed(error.to_string()),
+                    }
+                }
+            }
+        } else {
+            match queue_session_in_dir_with_runner_program(
+                db,
+                cfg,
+                &request.task,
+                &request.agent_type,
+                request.use_worktree,
+                &request.working_dir,
+                &runner_program,
+                request.profile_name.as_deref(),
+                None,
+                grouping,
+            )
+            .await
+            {
+                Ok(session_id) => {
+                    db.record_remote_dispatch_success(
+                        request.id,
+                        Some(&session_id),
+                        Some("spawned_top_level"),
+                    )?;
+                    RemoteDispatchOutcome {
+                        request_id: request.id,
+                        task: request.task.clone(),
+                        priority: request.priority,
+                        target_session_id: None,
+                        session_id: Some(session_id),
+                        action: RemoteDispatchAction::SpawnedTopLevel,
+                    }
+                }
+                Err(error) => {
+                    db.record_remote_dispatch_failure(request.id, &error.to_string())?;
+                    RemoteDispatchOutcome {
+                        request_id: request.id,
+                        task: request.task.clone(),
+                        priority: request.priority,
+                        target_session_id: None,
+                        session_id: None,
+                        action: RemoteDispatchAction::Failed(error.to_string()),
+                    }
+                }
+            }
+        };
+
+        outcomes.push(outcome);
+    }
+
+    Ok(outcomes)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -636,7 +1068,7 @@ pub async fn rebalance_team_backlog(
         return Ok(outcomes);
     }
 
-    let delegates = direct_delegate_sessions(db, &lead.id, agent_type)?;
+    let delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
     let unread_counts = db.unread_message_counts()?;
     let team_has_capacity = delegates.len() < cfg.max_parallel_sessions;
 
@@ -668,7 +1100,7 @@ pub async fn rebalance_team_backlog(
                 break;
             }
 
-            let current_delegates = direct_delegate_sessions(db, &lead.id, agent_type)?;
+            let current_delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
             let current_unread_counts = db.unread_message_counts()?;
             let current_team_has_capacity = current_delegates.len() < cfg.max_parallel_sessions;
             let current_has_clear_idle_elsewhere = current_delegates.iter().any(|candidate| {
@@ -1136,7 +1568,7 @@ async fn assign_session_in_dir_with_runner_program(
             .task_group
             .or_else(|| normalize_group_label(&lead.task_group)),
     };
-    let delegates = direct_delegate_sessions(db, &lead.id, agent_type)?;
+    let delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
     let delegate_handoff_backlog = delegates
         .iter()
         .map(|session| {
@@ -1896,9 +2328,22 @@ pub async fn delete_session(db: &StateStore, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn agent_program(agent_type: &str) -> Result<PathBuf> {
-    match agent_type {
-        "claude" => Ok(PathBuf::from("claude")),
+fn agent_program(cfg: &Config, agent_type: &str) -> Result<PathBuf> {
+    let harness = HarnessKind::from_agent_type(agent_type);
+    let runner_key = SessionHarnessInfo::runner_key(agent_type);
+    if let Some(runner) = cfg.harness_runner(&runner_key) {
+        let program = runner.program.trim();
+        if program.is_empty() {
+            anyhow::bail!("Configured harness runner for {runner_key} is missing a program");
+        }
+        return Ok(PathBuf::from(program));
+    }
+
+    match harness {
+        HarnessKind::Claude => Ok(PathBuf::from("claude")),
+        HarnessKind::Codex => Ok(PathBuf::from("codex")),
+        HarnessKind::OpenCode => Ok(PathBuf::from("opencode")),
+        HarnessKind::Gemini => Ok(PathBuf::from("gemini")),
         other => anyhow::bail!("Unsupported agent type: {other}"),
     }
 }
@@ -1911,6 +2356,32 @@ fn resolve_session(db: &StateStore, id: &str) -> Result<Session> {
     };
 
     session.ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))
+}
+
+fn parse_cron_schedule(expr: &str) -> Result<CronSchedule> {
+    let trimmed = expr.trim();
+    let normalized = match trimmed.split_whitespace().count() {
+        5 => format!("0 {trimmed}"),
+        6 | 7 => trimmed.to_string(),
+        fields => {
+            anyhow::bail!(
+                "invalid cron expression `{trimmed}`: expected 5, 6, or 7 fields but found {fields}"
+            )
+        }
+    };
+    CronSchedule::from_str(&normalized)
+        .with_context(|| format!("invalid cron expression `{trimmed}`"))
+}
+
+fn next_schedule_run_at(
+    expr: &str,
+    after: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    parse_cron_schedule(expr)?
+        .after(&after)
+        .next()
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .ok_or_else(|| anyhow::anyhow!("cron expression `{expr}` did not yield a future run time"))
 }
 
 pub async fn run_session(
@@ -1932,9 +2403,11 @@ pub async fn run_session(
         return Ok(());
     }
 
-    let agent_program = agent_program(agent_type)?;
+    let agent_program = agent_program(cfg, agent_type)?;
     let profile = db.get_session_profile(session_id)?;
     let command = build_agent_command(
+        cfg,
+        agent_type,
         &agent_program,
         task,
         session_id,
@@ -2099,11 +2572,12 @@ async fn queue_session_in_dir_with_runner_program(
     grouping: SessionGrouping,
 ) -> Result<String> {
     let profile = resolve_launch_profile(db, cfg, profile_name, inherited_profile_session_id)?;
+    let canonical_agent_type = HarnessKind::canonical_agent_type(agent_type);
     queue_session_with_resolved_profile_and_runner_program(
         db,
         cfg,
         task,
-        agent_type,
+        &canonical_agent_type,
         use_worktree,
         repo_root,
         runner_program,
@@ -2131,7 +2605,7 @@ async fn queue_session_with_resolved_profile_and_runner_program(
     let session = build_session_record(
         db,
         task,
-        effective_agent_type,
+        &effective_agent_type,
         use_worktree,
         cfg,
         repo_root,
@@ -2184,6 +2658,8 @@ fn build_session_record(
     repo_root: &Path,
     grouping: SessionGrouping,
 ) -> Result<Session> {
+    let canonical_agent_type =
+        SessionHarnessInfo::resolve_requested_agent_type(cfg, agent_type, repo_root);
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let now = chrono::Utc::now();
 
@@ -2212,7 +2688,7 @@ fn build_session_record(
         task: task.to_string(),
         project,
         task_group,
-        agent_type: agent_type.to_string(),
+        agent_type: canonical_agent_type,
         working_dir,
         state: SessionState::Pending,
         pid: None,
@@ -2334,16 +2810,24 @@ async fn spawn_session_runner(
 
 fn direct_delegate_sessions(
     db: &StateStore,
-    lead_id: &str,
+    cfg: &Config,
+    lead: &Session,
     agent_type: &str,
 ) -> Result<Vec<Session>> {
+    let resolved_agent_type =
+        SessionHarnessInfo::resolve_requested_agent_type(cfg, agent_type, &lead.working_dir);
+    let target_harness = HarnessKind::from_agent_type(&resolved_agent_type);
     let mut sessions = Vec::new();
-    for child_id in db.delegated_children(lead_id, 50)? {
+    for child_id in db.delegated_children(&lead.id, 50)? {
         let Some(session) = db.get_session(&child_id)? else {
             continue;
         };
 
-        if session.agent_type != agent_type {
+        if target_harness != HarnessKind::Unknown {
+            if HarnessKind::from_agent_type(&session.agent_type) != target_harness {
+                continue;
+            }
+        } else if session.agent_type != resolved_agent_type {
             continue;
         }
 
@@ -2424,7 +2908,8 @@ fn summarize_backlog_pressure(
     let mut summary = BacklogPressureSummary::default();
 
     for (session_id, _) in targets {
-        let delegates = direct_delegate_sessions(db, session_id, agent_type)?;
+        let lead = resolve_session(db, session_id)?;
+        let delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
         let has_clear_idle_delegate = delegates.iter().any(|delegate| {
             delegate.state == SessionState::Idle
                 && db.unread_task_handoff_count(&delegate.id).unwrap_or(0) == 0
@@ -2472,6 +2957,7 @@ fn send_task_handoff(
         &crate::comms::MessageType::TaskHandoff {
             task: task.to_string(),
             context,
+            priority: crate::comms::TaskPriority::Normal,
         },
     )
 }
@@ -2498,7 +2984,28 @@ async fn spawn_session_runner_for_program(
     working_dir: &Path,
     current_exe: &Path,
 ) -> Result<()> {
-    let child = Command::new(current_exe)
+    let stderr_log_path = background_runner_stderr_log_path(working_dir, session_id);
+    if let Some(parent) = stderr_log_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create ECC runner log directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let stderr_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log_path)
+        .with_context(|| {
+            format!(
+                "Failed to open ECC runner stderr log {}",
+                stderr_log_path.display()
+            )
+        })?;
+
+    let mut command = Command::new(current_exe);
+    command
         .arg("run-session")
         .arg("--session-id")
         .arg(session_id)
@@ -2510,7 +3017,10 @@ async fn spawn_session_runner_for_program(
         .arg(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_log));
+    configure_background_runner_command(&mut command);
+
+    let child = command
         .spawn()
         .with_context(|| format!("Failed to spawn ECC runner from {}", current_exe.display()))?;
 
@@ -2520,47 +3030,157 @@ async fn spawn_session_runner_for_program(
     Ok(())
 }
 
+fn background_runner_stderr_log_path(working_dir: &Path, session_id: &str) -> PathBuf {
+    working_dir
+        .join(".claude")
+        .join("ecc2")
+        .join("logs")
+        .join(format!("{session_id}.runner-stderr.log"))
+}
+
+#[cfg(windows)]
+fn detached_creation_flags() -> u32 {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+}
+
+fn configure_background_runner_command(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // Detach the runner from the caller's shell/session so it keeps
+        // processing a live harness session after `ecc-tui start` returns.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        command.as_std_mut().creation_flags(detached_creation_flags());
+    }
+}
+
 fn build_agent_command(
+    cfg: &Config,
+    agent_type: &str,
     agent_program: &Path,
     task: &str,
     session_id: &str,
     working_dir: &Path,
     profile: Option<&SessionAgentProfile>,
 ) -> Command {
+    let harness = HarnessKind::from_agent_type(agent_type);
+    if let Some(runner) = cfg.harness_runner(&SessionHarnessInfo::runner_key(agent_type)) {
+        return build_configured_harness_command(
+            runner,
+            agent_type,
+            agent_program,
+            task,
+            session_id,
+            working_dir,
+            profile,
+        );
+    }
+
+    let task = normalize_task_for_harness(harness, task, profile);
     let mut command = Command::new(agent_program);
-    command.env("ECC_SESSION_ID", session_id);
-    command
-        .arg("--print")
-        .arg("--name")
-        .arg(format!("ecc-{session_id}"));
-    if let Some(profile) = profile {
-        if let Some(model) = profile.model.as_ref() {
-            command.arg("--model").arg(model);
-        }
-        if !profile.allowed_tools.is_empty() {
+    apply_shared_harness_runtime_env(&mut command, agent_type, session_id, working_dir, profile);
+    match harness {
+        HarnessKind::Claude => {
             command
-                .arg("--allowed-tools")
-                .arg(profile.allowed_tools.join(","));
+                .arg("--print")
+                .arg("--name")
+                .arg(format!("ecc-{session_id}"));
+            if let Some(profile) = profile {
+                if let Some(model) = profile.model.as_ref() {
+                    command.arg("--model").arg(model);
+                }
+                if !profile.allowed_tools.is_empty() {
+                    command
+                        .arg("--allowed-tools")
+                        .arg(profile.allowed_tools.join(","));
+                }
+                if !profile.disallowed_tools.is_empty() {
+                    command
+                        .arg("--disallowed-tools")
+                        .arg(profile.disallowed_tools.join(","));
+                }
+                if let Some(permission_mode) = profile.permission_mode.as_ref() {
+                    command.arg("--permission-mode").arg(permission_mode);
+                }
+                for dir in &profile.add_dirs {
+                    command.arg("--add-dir").arg(dir);
+                }
+                if let Some(max_budget_usd) = profile.max_budget_usd {
+                    command
+                        .arg("--max-budget-usd")
+                        .arg(max_budget_usd.to_string());
+                }
+                if let Some(prompt) = profile.append_system_prompt.as_ref() {
+                    command.arg("--append-system-prompt").arg(prompt);
+                }
+            }
         }
-        if !profile.disallowed_tools.is_empty() {
+        HarnessKind::Codex => {
             command
-                .arg("--disallowed-tools")
-                .arg(profile.disallowed_tools.join(","));
+                .arg("exec")
+                .arg("--skip-git-repo-check")
+                .arg("--sandbox")
+                .arg("workspace-write")
+                .arg("--cd")
+                .arg(working_dir)
+                .arg("--color")
+                .arg("never");
+            if let Some(profile) = profile {
+                if let Some(model) = profile.model.as_ref() {
+                    command.arg("--model").arg(model);
+                }
+                for dir in &profile.add_dirs {
+                    command.arg("--add-dir").arg(dir);
+                }
+            }
         }
-        if let Some(permission_mode) = profile.permission_mode.as_ref() {
-            command.arg("--permission-mode").arg(permission_mode);
-        }
-        for dir in &profile.add_dirs {
-            command.arg("--add-dir").arg(dir);
-        }
-        if let Some(max_budget_usd) = profile.max_budget_usd {
+        HarnessKind::OpenCode => {
             command
-                .arg("--max-budget-usd")
-                .arg(max_budget_usd.to_string());
+                .arg("run")
+                .arg("--dir")
+                .arg(working_dir)
+                .arg("--title")
+                .arg(format!("ecc-{session_id}"));
+            if let Some(profile) = profile {
+                if let Some(model) = profile.model.as_ref() {
+                    command.arg("--model").arg(model);
+                }
+            }
         }
-        if let Some(prompt) = profile.append_system_prompt.as_ref() {
-            command.arg("--append-system-prompt").arg(prompt);
+        HarnessKind::Gemini => {
+            command.arg("-p");
+            if let Some(profile) = profile {
+                if let Some(model) = profile.model.as_ref() {
+                    command.arg("-m").arg(model);
+                }
+                if !profile.add_dirs.is_empty() {
+                    let include_dirs = profile
+                        .add_dirs
+                        .iter()
+                        .map(|dir| dir.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    command.arg("--include-directories").arg(include_dirs);
+                }
+            }
         }
+        _ => {}
     }
     command
         .arg(task)
@@ -2569,13 +3189,373 @@ fn build_agent_command(
     command
 }
 
+fn build_configured_harness_command(
+    runner: &crate::config::HarnessRunnerConfig,
+    agent_type: &str,
+    agent_program: &Path,
+    task: &str,
+    session_id: &str,
+    working_dir: &Path,
+    profile: Option<&SessionAgentProfile>,
+) -> Command {
+    let mut command = Command::new(agent_program);
+    apply_shared_harness_runtime_env(&mut command, agent_type, session_id, working_dir, profile);
+    for (key, value) in &runner.env {
+        if !value.trim().is_empty() {
+            command.env(key, value);
+        }
+    }
+    for arg in &runner.base_args {
+        if !arg.trim().is_empty() {
+            command.arg(arg);
+        }
+    }
+    if let Some(flag) = runner.cwd_flag.as_deref() {
+        command.arg(flag).arg(working_dir);
+    }
+    if let Some(flag) = runner.session_name_flag.as_deref() {
+        command.arg(flag).arg(format!("ecc-{session_id}"));
+    }
+    if let Some(profile) = profile {
+        if let (Some(flag), Some(model)) = (runner.model_flag.as_deref(), profile.model.as_ref()) {
+            command.arg(flag).arg(model);
+        }
+        if let Some(flag) = runner.add_dir_flag.as_deref() {
+            for dir in &profile.add_dirs {
+                command.arg(flag).arg(dir);
+            }
+        }
+        if let Some(flag) = runner.include_directories_flag.as_deref() {
+            if !profile.add_dirs.is_empty() {
+                let include_dirs = profile
+                    .add_dirs
+                    .iter()
+                    .map(|dir| dir.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                command.arg(flag).arg(include_dirs);
+            }
+        }
+        if let Some(flag) = runner.allowed_tools_flag.as_deref() {
+            if !profile.allowed_tools.is_empty() {
+                command.arg(flag).arg(profile.allowed_tools.join(","));
+            }
+        }
+        if let Some(flag) = runner.disallowed_tools_flag.as_deref() {
+            if !profile.disallowed_tools.is_empty() {
+                command.arg(flag).arg(profile.disallowed_tools.join(","));
+            }
+        }
+        if let (Some(flag), Some(permission_mode)) = (
+            runner.permission_mode_flag.as_deref(),
+            profile.permission_mode.as_ref(),
+        ) {
+            command.arg(flag).arg(permission_mode);
+        }
+        if let (Some(flag), Some(max_budget_usd)) = (
+            runner.max_budget_usd_flag.as_deref(),
+            profile.max_budget_usd,
+        ) {
+            command.arg(flag).arg(max_budget_usd.to_string());
+        }
+        if let (Some(flag), Some(prompt)) = (
+            runner.append_system_prompt_flag.as_deref(),
+            profile.append_system_prompt.as_ref(),
+        ) {
+            command.arg(flag).arg(prompt);
+        }
+    }
+
+    let task = normalize_task_for_configured_runner(runner, task, profile);
+
+    if let Some(flag) = runner.task_flag.as_deref() {
+        command.arg(flag);
+    }
+    command
+        .arg(task)
+        .current_dir(working_dir)
+        .stdin(Stdio::null());
+    command
+}
+
+fn apply_shared_harness_runtime_env(
+    command: &mut Command,
+    agent_type: &str,
+    session_id: &str,
+    working_dir: &Path,
+    profile: Option<&SessionAgentProfile>,
+) {
+    let harness_label = SessionHarnessInfo::runner_key(agent_type);
+    command.env("ECC_SESSION_ID", session_id);
+    command.env("ECC_HARNESS", &harness_label);
+    command.env("ECC_WORKING_DIR", working_dir);
+    command.env("ECC_PROJECT_DIR", working_dir);
+    command.env("CLAUDE_SESSION_ID", session_id);
+    command.env("CLAUDE_PROJECT_DIR", working_dir);
+    command.env("CLAUDE_CODE_ENTRYPOINT", "cli");
+    if let Some(package_manager) = resolve_project_package_manager(working_dir) {
+        command.env("CLAUDE_PACKAGE_MANAGER", package_manager);
+        command.env("CLAUDE_CODE_PACKAGE_MANAGER", package_manager);
+    }
+    if let Some(model) = profile.and_then(|profile| profile.model.as_ref()) {
+        command.env("CLAUDE_MODEL", model);
+    }
+    if let Some(plugin_root) = resolve_ecc_plugin_root() {
+        command.env("ECC_PLUGIN_ROOT", &plugin_root);
+        command.env("CLAUDE_PLUGIN_ROOT", &plugin_root);
+    }
+}
+
+fn resolve_ecc_plugin_root() -> Option<PathBuf> {
+    let mut seeds = Vec::new();
+    if let Ok(current_exe) = std::env::current_exe() {
+        seeds.push(current_exe);
+    }
+    seeds.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    for seed in seeds {
+        for candidate in seed.ancestors() {
+            if is_ecc_plugin_root(candidate) {
+                return Some(candidate.to_path_buf());
+            }
+        }
+    }
+
+    None
+}
+
+fn is_ecc_plugin_root(candidate: &Path) -> bool {
+    candidate.join("scripts/lib/utils.js").is_file() && candidate.join("hooks/hooks.json").is_file()
+}
+
+fn resolve_project_package_manager(working_dir: &Path) -> Option<&'static str> {
+    if let Ok(package_manager) = std::env::var("CLAUDE_PACKAGE_MANAGER") {
+        if let Some(package_manager) = normalize_package_manager_name(&package_manager) {
+            return Some(package_manager);
+        }
+    }
+
+    read_package_manager_from_json(
+        &working_dir.join(".claude").join("package-manager.json"),
+        "packageManager",
+    )
+    .or_else(|| read_package_manager_from_package_json(&working_dir.join("package.json")))
+    .or_else(|| detect_package_manager_from_lockfile(working_dir))
+    .or_else(|| {
+        dirs::home_dir().and_then(|home_dir| {
+            read_package_manager_from_json(
+                &home_dir.join(".claude").join("package-manager.json"),
+                "packageManager",
+            )
+        })
+    })
+    .or(Some("npm"))
+}
+
+fn read_package_manager_from_json(path: &Path, field_name: &str) -> Option<&'static str> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value
+        .get(field_name)
+        .and_then(|value| value.as_str())
+        .and_then(normalize_package_manager_name)
+}
+
+fn read_package_manager_from_package_json(path: &Path) -> Option<&'static str> {
+    let package_manager = read_package_manager_from_json(path, "packageManager")?;
+    Some(package_manager)
+}
+
+fn detect_package_manager_from_lockfile(working_dir: &Path) -> Option<&'static str> {
+    [
+        ("pnpm", "pnpm-lock.yaml"),
+        ("bun", "bun.lockb"),
+        ("yarn", "yarn.lock"),
+        ("npm", "package-lock.json"),
+    ]
+    .into_iter()
+    .find_map(|(package_manager, lockfile)| {
+        working_dir
+            .join(lockfile)
+            .is_file()
+            .then_some(package_manager)
+    })
+}
+
+fn normalize_package_manager_name(package_manager: &str) -> Option<&'static str> {
+    let canonical = package_manager
+        .split('@')
+        .next()
+        .unwrap_or(package_manager)
+        .trim();
+    match canonical {
+        "npm" => Some("npm"),
+        "pnpm" => Some("pnpm"),
+        "yarn" => Some("yarn"),
+        "bun" => Some("bun"),
+        _ => None,
+    }
+}
+
+fn normalize_task_for_harness(
+    harness: HarnessKind,
+    task: &str,
+    profile: Option<&SessionAgentProfile>,
+) -> String {
+    match harness {
+        HarnessKind::Claude => task.to_string(),
+        HarnessKind::Codex => render_task_with_profile_projection(
+            task,
+            profile,
+            TaskProjectionSupport {
+                supports_model: true,
+                supports_add_dirs: true,
+                ..TaskProjectionSupport::default()
+            },
+        ),
+        HarnessKind::OpenCode => render_task_with_profile_projection(
+            task,
+            profile,
+            TaskProjectionSupport {
+                supports_model: true,
+                ..TaskProjectionSupport::default()
+            },
+        ),
+        HarnessKind::Gemini => render_task_with_profile_projection(
+            task,
+            profile,
+            TaskProjectionSupport {
+                supports_model: true,
+                supports_add_dirs: true,
+                ..TaskProjectionSupport::default()
+            },
+        ),
+        _ => task.to_string(),
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TaskProjectionSupport {
+    supports_model: bool,
+    supports_add_dirs: bool,
+    supports_allowed_tools: bool,
+    supports_disallowed_tools: bool,
+    supports_permission_mode: bool,
+    supports_max_budget_usd: bool,
+    supports_append_system_prompt: bool,
+}
+
+fn normalize_task_for_configured_runner(
+    runner: &crate::config::HarnessRunnerConfig,
+    task: &str,
+    profile: Option<&SessionAgentProfile>,
+) -> String {
+    render_task_with_profile_projection(
+        task,
+        profile,
+        TaskProjectionSupport {
+            supports_model: runner.model_flag.is_some(),
+            supports_add_dirs: runner.add_dir_flag.is_some()
+                || runner.include_directories_flag.is_some(),
+            supports_allowed_tools: runner.allowed_tools_flag.is_some(),
+            supports_disallowed_tools: runner.disallowed_tools_flag.is_some(),
+            supports_permission_mode: runner.permission_mode_flag.is_some(),
+            supports_max_budget_usd: runner.max_budget_usd_flag.is_some(),
+            supports_append_system_prompt: runner.append_system_prompt_flag.is_some()
+                && !runner.inline_system_prompt_for_task,
+        },
+    )
+}
+
+fn render_task_with_profile_projection(
+    task: &str,
+    profile: Option<&SessionAgentProfile>,
+    support: TaskProjectionSupport,
+) -> String {
+    let Some(profile) = profile else {
+        return task.to_string();
+    };
+
+    let mut sections = Vec::new();
+    if !support.supports_append_system_prompt {
+        if let Some(system_prompt) = profile.append_system_prompt.as_ref() {
+            sections.push(format!("System instructions:\n{system_prompt}"));
+        }
+    }
+
+    let mut directives = Vec::new();
+    if !support.supports_model {
+        if let Some(model) = profile.model.as_ref() {
+            directives.push(format!("Preferred model: {model}"));
+        }
+    }
+    if !support.supports_add_dirs && !profile.add_dirs.is_empty() {
+        directives.push(format!(
+            "Additional context dirs: {}",
+            profile
+                .add_dirs
+                .iter()
+                .map(|dir| dir.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !support.supports_allowed_tools && !profile.allowed_tools.is_empty() {
+        directives.push(format!(
+            "Allowed tools: {}",
+            profile.allowed_tools.join(", ")
+        ));
+    }
+    if !support.supports_disallowed_tools && !profile.disallowed_tools.is_empty() {
+        directives.push(format!(
+            "Disallowed tools: {}",
+            profile.disallowed_tools.join(", ")
+        ));
+    }
+    if !support.supports_permission_mode {
+        if let Some(permission_mode) = profile.permission_mode.as_ref() {
+            directives.push(format!("Permission mode: {permission_mode}"));
+        }
+    }
+    if !support.supports_max_budget_usd {
+        if let Some(max_budget_usd) = profile.max_budget_usd {
+            directives.push(format!("Max budget USD: {max_budget_usd}"));
+        }
+    }
+    if let Some(token_budget) = profile.token_budget {
+        directives.push(format!("Token budget: {token_budget}"));
+    }
+
+    if !directives.is_empty() {
+        sections.push(format!(
+            "ECC execution profile:\n- {}",
+            directives.join("\n- ")
+        ));
+    }
+
+    if sections.is_empty() {
+        return task.to_string();
+    }
+
+    sections.push(format!("Task:\n{task}"));
+    sections.join("\n\n")
+}
+
 async fn spawn_claude_code(
     agent_program: &Path,
     task: &str,
     session_id: &str,
     working_dir: &Path,
 ) -> Result<u32> {
-    let mut command = build_agent_command(agent_program, task, session_id, working_dir, None);
+    let mut command = build_agent_command(
+        &Config::default(),
+        "claude",
+        agent_program,
+        task,
+        session_id,
+        working_dir,
+        None,
+    );
     let child = command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2715,6 +3695,34 @@ pub struct LeadDispatchOutcome {
     pub routed: Vec<InboxDrainOutcome>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ScheduledRunOutcome {
+    pub schedule_id: i64,
+    pub session_id: String,
+    pub task: String,
+    pub cron_expr: String,
+    pub next_run_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteDispatchOutcome {
+    pub request_id: i64,
+    pub task: String,
+    pub priority: TaskPriority,
+    pub target_session_id: Option<String>,
+    pub session_id: Option<String>,
+    pub action: RemoteDispatchAction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "details")]
+pub enum RemoteDispatchAction {
+    SpawnedTopLevel,
+    Assigned(AssignmentAction),
+    DeferredSaturated,
+    Failed(String),
+}
+
 pub struct RebalanceOutcome {
     pub from_session_id: String,
     pub message_id: i64,
@@ -2769,12 +3777,24 @@ pub enum CoordinationHealth {
     EscalationRequired,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AssignmentAction {
     Spawned,
     ReusedIdle,
     ReusedActive,
     DeferredSaturated,
+}
+
+impl AssignmentAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::ReusedIdle => "reused_idle",
+            Self::ReusedActive => "reused_active",
+            Self::DeferredSaturated => "deferred_saturated",
+        }
+    }
 }
 
 pub fn preview_assignment_for_task(
@@ -2785,7 +3805,7 @@ pub fn preview_assignment_for_task(
     agent_type: &str,
 ) -> Result<AssignmentPreview> {
     let lead = resolve_session(db, lead_id)?;
-    let delegates = direct_delegate_sessions(db, &lead.id, agent_type)?;
+    let delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
     let delegate_handoff_backlog = delegates
         .iter()
         .map(|session| {
@@ -2968,7 +3988,7 @@ impl fmt::Display for SessionStatus {
         writeln!(f, "Session: {}", s.id)?;
         writeln!(f, "Task:    {}", s.task)?;
         writeln!(f, "Agent:   {}", s.agent_type)?;
-        writeln!(f, "Harness: {}", self.harness.primary)?;
+        writeln!(f, "Harness: {}", self.harness.primary_label)?;
         writeln!(f, "Detected: {}", self.harness.detected_summary())?;
         writeln!(f, "State:   {}", s.state)?;
         if let Some(profile) = self.profile.as_ref() {
@@ -3259,9 +4279,11 @@ mod tests {
             auto_terminate_stale_sessions: false,
             default_agent: "claude".to_string(),
             default_agent_profile: None,
+            harness_runners: Default::default(),
             agent_profiles: Default::default(),
             orchestration_templates: Default::default(),
             memory_connectors: Default::default(),
+            computer_use_dispatch: crate::config::ComputerUseDispatchConfig::default(),
             auto_dispatch_unread_handoffs: false,
             auto_dispatch_limit_per_session: 5,
             auto_create_worktrees: true,
@@ -3302,7 +4324,8 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_command_applies_profile_runner_flags() {
+    fn build_agent_command_applies_profile_runner_flags_for_claude() {
+        let cfg = Config::default();
         let profile = SessionAgentProfile {
             profile_name: "reviewer".to_string(),
             agent: None,
@@ -3317,6 +4340,8 @@ mod tests {
         };
 
         let command = build_agent_command(
+            &cfg,
+            "claude",
             Path::new("claude"),
             "review this change",
             "sess-1234",
@@ -3354,6 +4379,561 @@ mod tests {
                 "review this change",
             ]
         );
+    }
+
+    #[test]
+    fn build_agent_command_normalizes_runner_flags_for_codex() {
+        let cfg = Config::default();
+        let profile = SessionAgentProfile {
+            profile_name: "reviewer".to_string(),
+            agent: None,
+            model: Some("gpt-5.4".to_string()),
+            allowed_tools: vec!["Read".to_string()],
+            disallowed_tools: vec!["Bash".to_string()],
+            permission_mode: Some("plan".to_string()),
+            add_dirs: vec![PathBuf::from("docs"), PathBuf::from("specs")],
+            max_budget_usd: Some(1.25),
+            token_budget: Some(750),
+            append_system_prompt: Some("Review thoroughly.".to_string()),
+        };
+
+        let command = build_agent_command(
+            &cfg,
+            "codex",
+            Path::new("codex"),
+            "review this change",
+            "sess-1234",
+            Path::new("/tmp/repo"),
+            Some(&profile),
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "workspace-write",
+                "--cd",
+                "/tmp/repo",
+                "--color",
+                "never",
+                "--model",
+                "gpt-5.4",
+                "--add-dir",
+                "docs",
+                "--add-dir",
+                "specs",
+                "System instructions:\nReview thoroughly.\n\nECC execution profile:\n- Allowed tools: Read\n- Disallowed tools: Bash\n- Permission mode: plan\n- Max budget USD: 1.25\n- Token budget: 750\n\nTask:\nreview this change",
+            ]
+        );
+
+        let envs = command_env_map(&command);
+        assert_eq!(envs.get("ECC_SESSION_ID"), Some(&"sess-1234".to_string()));
+        assert_eq!(
+            envs.get("CLAUDE_SESSION_ID"),
+            Some(&"sess-1234".to_string())
+        );
+        assert_eq!(
+            envs.get("CLAUDE_PROJECT_DIR"),
+            Some(&"/tmp/repo".to_string())
+        );
+        assert_eq!(envs.get("CLAUDE_CODE_ENTRYPOINT"), Some(&"cli".to_string()));
+        assert_eq!(envs.get("ECC_HARNESS"), Some(&"codex".to_string()));
+        assert_eq!(envs.get("CLAUDE_MODEL"), Some(&"gpt-5.4".to_string()));
+        assert!(
+            envs.contains_key("CLAUDE_PLUGIN_ROOT"),
+            "shared compatibility env should expose the ECC plugin root"
+        );
+    }
+
+    #[test]
+    fn build_agent_command_normalizes_runner_flags_for_opencode() {
+        let cfg = Config::default();
+        let profile = SessionAgentProfile {
+            profile_name: "builder".to_string(),
+            agent: None,
+            model: Some("anthropic/claude-sonnet-4".to_string()),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            permission_mode: None,
+            add_dirs: vec![PathBuf::from("docs")],
+            max_budget_usd: None,
+            token_budget: None,
+            append_system_prompt: Some("Build carefully.".to_string()),
+        };
+
+        let command = build_agent_command(
+            &cfg,
+            "opencode",
+            Path::new("opencode"),
+            "stabilize callback flow",
+            "sess-9999",
+            Path::new("/tmp/repo"),
+            Some(&profile),
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--dir",
+                "/tmp/repo",
+                "--title",
+                "ecc-sess-9999",
+                "--model",
+                "anthropic/claude-sonnet-4",
+                "System instructions:\nBuild carefully.\n\nECC execution profile:\n- Additional context dirs: docs\n\nTask:\nstabilize callback flow",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_agent_command_normalizes_runner_flags_for_gemini() {
+        let cfg = Config::default();
+        let profile = SessionAgentProfile {
+            profile_name: "investigator".to_string(),
+            agent: None,
+            model: Some("gemini-2.5-pro".to_string()),
+            allowed_tools: vec!["Read".to_string()],
+            disallowed_tools: vec!["Bash".to_string()],
+            permission_mode: Some("plan".to_string()),
+            add_dirs: vec![PathBuf::from("docs"), PathBuf::from("../shared")],
+            max_budget_usd: Some(1.0),
+            token_budget: Some(500),
+            append_system_prompt: Some("Use repo context carefully.".to_string()),
+        };
+
+        let command = build_agent_command(
+            &cfg,
+            "gemini",
+            Path::new("gemini"),
+            "investigate auth regression",
+            "sess-gem1",
+            Path::new("/tmp/repo"),
+            Some(&profile),
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "-m",
+                "gemini-2.5-pro",
+                "--include-directories",
+                "docs,../shared",
+                "System instructions:\nUse repo context carefully.\n\nECC execution profile:\n- Allowed tools: Read\n- Disallowed tools: Bash\n- Permission mode: plan\n- Max budget USD: 1\n- Token budget: 500\n\nTask:\ninvestigate auth regression",
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_program_uses_configured_runner_for_cursor() -> Result<()> {
+        let mut cfg = Config::default();
+        cfg.harness_runners.insert(
+            "cursor".to_string(),
+            crate::config::HarnessRunnerConfig {
+                program: "cursor-agent".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            agent_program(&cfg, "cursor")?,
+            PathBuf::from("cursor-agent")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_program_uses_configured_runner_for_unknown_custom_harness() -> Result<()> {
+        let mut cfg = Config::default();
+        cfg.harness_runners.insert(
+            "acme-runner".to_string(),
+            crate::config::HarnessRunnerConfig {
+                program: "acme-agent".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            agent_program(&cfg, "acme-runner")?,
+            PathBuf::from("acme-agent")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_agent_command_uses_configured_runner_for_cursor() {
+        let mut cfg = Config::default();
+        cfg.harness_runners.insert(
+            "cursor".to_string(),
+            crate::config::HarnessRunnerConfig {
+                program: "cursor-agent".to_string(),
+                base_args: vec!["run".to_string()],
+                cwd_flag: Some("--cwd".to_string()),
+                session_name_flag: Some("--name".to_string()),
+                task_flag: Some("--task".to_string()),
+                model_flag: Some("--model".to_string()),
+                permission_mode_flag: Some("--permission-mode".to_string()),
+                add_dir_flag: Some("--context-dir".to_string()),
+                inline_system_prompt_for_task: true,
+                env: BTreeMap::from([("ECC_HARNESS".to_string(), "cursor".to_string())]),
+                ..Default::default()
+            },
+        );
+        let profile = SessionAgentProfile {
+            profile_name: "worker".to_string(),
+            agent: None,
+            model: Some("gpt-5.4".to_string()),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            permission_mode: Some("plan".to_string()),
+            add_dirs: vec![PathBuf::from("docs"), PathBuf::from("specs")],
+            max_budget_usd: None,
+            token_budget: None,
+            append_system_prompt: Some("Use repo context carefully.".to_string()),
+        };
+
+        let command = build_agent_command(
+            &cfg,
+            "cursor",
+            Path::new("cursor-agent"),
+            "fix callback regression",
+            "sess-cur1",
+            Path::new("/tmp/repo"),
+            Some(&profile),
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--cwd",
+                "/tmp/repo",
+                "--name",
+                "ecc-sess-cur1",
+                "--model",
+                "gpt-5.4",
+                "--context-dir",
+                "docs",
+                "--context-dir",
+                "specs",
+                "--permission-mode",
+                "plan",
+                "--task",
+                "System instructions:\nUse repo context carefully.\n\nTask:\nfix callback regression",
+            ]
+        );
+        let envs = command_env_map(&command);
+        assert_eq!(envs.get("ECC_SESSION_ID"), Some(&"sess-cur1".to_string()));
+        assert_eq!(
+            envs.get("CLAUDE_SESSION_ID"),
+            Some(&"sess-cur1".to_string())
+        );
+        assert_eq!(
+            envs.get("CLAUDE_PROJECT_DIR"),
+            Some(&"/tmp/repo".to_string())
+        );
+        assert_eq!(envs.get("CLAUDE_CODE_ENTRYPOINT"), Some(&"cli".to_string()));
+        assert_eq!(envs.get("ECC_HARNESS"), Some(&"cursor".to_string()));
+        assert_eq!(envs.get("CLAUDE_MODEL"), Some(&"gpt-5.4".to_string()));
+        assert_eq!(envs.get("ECC_PLUGIN_ROOT"), envs.get("CLAUDE_PLUGIN_ROOT"));
+    }
+
+    #[test]
+    fn build_agent_command_projects_unsupported_profile_fields_for_configured_runner() {
+        let mut cfg = Config::default();
+        cfg.harness_runners.insert(
+            "cursor".to_string(),
+            crate::config::HarnessRunnerConfig {
+                program: "cursor-agent".to_string(),
+                base_args: vec!["run".to_string()],
+                task_flag: Some("--task".to_string()),
+                model_flag: Some("--model".to_string()),
+                ..Default::default()
+            },
+        );
+        let profile = SessionAgentProfile {
+            profile_name: "worker".to_string(),
+            agent: None,
+            model: Some("gpt-5.4".to_string()),
+            allowed_tools: vec!["Read".to_string()],
+            disallowed_tools: vec!["Bash".to_string()],
+            permission_mode: Some("plan".to_string()),
+            add_dirs: vec![PathBuf::from("docs"), PathBuf::from("specs")],
+            max_budget_usd: Some(2.5),
+            token_budget: Some(900),
+            append_system_prompt: Some("Use repo context carefully.".to_string()),
+        };
+
+        let command = build_agent_command(
+            &cfg,
+            "cursor",
+            Path::new("cursor-agent"),
+            "fix callback regression",
+            "sess-cur2",
+            Path::new("/tmp/repo"),
+            Some(&profile),
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--model",
+                "gpt-5.4",
+                "--task",
+                "System instructions:\nUse repo context carefully.\n\nECC execution profile:\n- Additional context dirs: docs, specs\n- Allowed tools: Read\n- Disallowed tools: Bash\n- Permission mode: plan\n- Max budget USD: 2.5\n- Token budget: 900\n\nTask:\nfix callback regression",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_agent_command_exports_detected_package_manager_env_from_lockfile() -> Result<()> {
+        let tempdir = TestDir::new("manager-package-manager-lockfile")?;
+        let repo_root = tempdir.path().join("repo");
+        fs::create_dir_all(&repo_root)?;
+        write_package_manager_project_files(&repo_root, None, Some("pnpm-lock.yaml"), None)?;
+
+        let cfg = Config::default();
+        let command = build_agent_command(
+            &cfg,
+            "codex",
+            Path::new("codex"),
+            "inspect dependency graph",
+            "sess-pnpm",
+            &repo_root,
+            None,
+        );
+        let envs = command_env_map(&command);
+        assert_eq!(
+            envs.get("CLAUDE_PACKAGE_MANAGER"),
+            Some(&"pnpm".to_string())
+        );
+        assert_eq!(
+            envs.get("CLAUDE_CODE_PACKAGE_MANAGER"),
+            Some(&"pnpm".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_agent_command_prefers_project_package_manager_config_over_lockfile() -> Result<()> {
+        let tempdir = TestDir::new("manager-package-manager-config")?;
+        let repo_root = tempdir.path().join("repo");
+        fs::create_dir_all(&repo_root)?;
+        write_package_manager_project_files(
+            &repo_root,
+            Some("pnpm@9.0.0"),
+            Some("package-lock.json"),
+            Some("yarn"),
+        )?;
+
+        let cfg = Config::default();
+        let command = build_agent_command(
+            &cfg,
+            "codex",
+            Path::new("codex"),
+            "inspect dependency graph",
+            "sess-yarn",
+            &repo_root,
+            None,
+        );
+        let envs = command_env_map(&command);
+        assert_eq!(
+            envs.get("CLAUDE_PACKAGE_MANAGER"),
+            Some(&"yarn".to_string())
+        );
+        assert_eq!(
+            envs.get("CLAUDE_CODE_PACKAGE_MANAGER"),
+            Some(&"yarn".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_session_record_canonicalizes_known_agent_aliases() -> Result<()> {
+        let tempdir = TestDir::new("manager-canonical-agent-type")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let session = build_session_record(
+            &db,
+            "Investigate auth callback",
+            "gemini-cli",
+            false,
+            &cfg,
+            &repo_root,
+            SessionGrouping::default(),
+        )?;
+
+        assert_eq!(session.agent_type, "gemini");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_delegate_sessions_matches_harness_aliases_for_existing_rows() -> Result<()> {
+        let tempdir = TestDir::new("manager-delegate-alias-match")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "Lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "child".to_string(),
+            task: "Delegate task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude-code".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: Some(7),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "child",
+            "{\"task\":\"Delegate task\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+
+        let lead = resolve_session(&db, "lead")?;
+        let delegates = direct_delegate_sessions(&db, &cfg, &lead, "claude")?;
+        assert_eq!(delegates.len(), 1);
+        assert_eq!(delegates[0].id, "child");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_delegate_sessions_resolves_auto_to_configured_harness() -> Result<()> {
+        let tempdir = TestDir::new("manager-delegate-auto-custom-harness")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(repo_root.join(".acme"))?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.harness_runners.insert(
+            "acme-runner".to_string(),
+            crate::config::HarnessRunnerConfig {
+                project_markers: vec![PathBuf::from(".acme")],
+                ..Default::default()
+            },
+        );
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "Lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "acme-runner".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "custom-child".to_string(),
+            task: "Delegate task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "acme-runner".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: Some(7),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "claude-child".to_string(),
+            task: "Other delegate task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: Some(8),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "custom-child",
+            "{\"task\":\"Delegate task\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "lead",
+            "claude-child",
+            "{\"task\":\"Other delegate task\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+
+        let lead = resolve_session(&db, "lead")?;
+        let delegates = direct_delegate_sessions(&db, &cfg, &lead, "auto")?;
+        assert_eq!(delegates.len(), 1);
+        assert_eq!(delegates[0].id, "custom-child");
+        Ok(())
     }
 
     #[test]
@@ -3489,7 +5069,7 @@ mod tests {
         let script_path = root.join("fake-claude.sh");
         let log_path = root.join("fake-claude.log");
         let script = format!(
-            "#!/usr/bin/env python3\nimport os\nimport pathlib\nimport signal\nimport sys\nimport time\n\nlog_path = pathlib.Path(r\"{}\")\nlog_path.write_text(os.getcwd() + \"\\n\", encoding=\"utf-8\")\nwith log_path.open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\n    handle.write(\"ECC_SESSION_ID=\" + os.environ.get(\"ECC_SESSION_ID\", \"\") + \"\\n\")\n\ndef handle_term(signum, frame):\n    raise SystemExit(0)\n\nsignal.signal(signal.SIGTERM, handle_term)\nwhile True:\n    time.sleep(0.1)\n",
+            "#!/usr/bin/env python3\nimport os\nimport pathlib\nimport signal\nimport sys\nimport time\n\nlog_path = pathlib.Path(r\"{}\")\nlog_path.write_text(os.getcwd() + \"\\n\", encoding=\"utf-8\")\nwith log_path.open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\n    handle.write(\"ECC_SESSION_ID=\" + os.environ.get(\"ECC_SESSION_ID\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_SESSION_ID=\" + os.environ.get(\"CLAUDE_SESSION_ID\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_PROJECT_DIR=\" + os.environ.get(\"CLAUDE_PROJECT_DIR\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_CODE_ENTRYPOINT=\" + os.environ.get(\"CLAUDE_CODE_ENTRYPOINT\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_PACKAGE_MANAGER=\" + os.environ.get(\"CLAUDE_PACKAGE_MANAGER\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_CODE_PACKAGE_MANAGER=\" + os.environ.get(\"CLAUDE_CODE_PACKAGE_MANAGER\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_PLUGIN_ROOT=\" + os.environ.get(\"CLAUDE_PLUGIN_ROOT\", \"\") + \"\\n\")\n    handle.write(\"ECC_HARNESS=\" + os.environ.get(\"ECC_HARNESS\", \"\") + \"\\n\")\n\ndef handle_term(signum, frame):\n    raise SystemExit(0)\n\nsignal.signal(signal.SIGTERM, handle_term)\nwhile True:\n    time.sleep(0.1)\n",
             log_path.display()
         );
 
@@ -3517,11 +5097,127 @@ mod tests {
         anyhow::bail!("timed out waiting for {}", path.display());
     }
 
+    fn wait_for_text(path: &Path, needle: &str) -> Result<String> {
+        for _ in 0..200 {
+            if path.exists() {
+                let content = fs::read_to_string(path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                if content.contains(needle) {
+                    return Ok(content);
+                }
+            }
+
+            thread::sleep(StdDuration::from_millis(20));
+        }
+
+        anyhow::bail!("timed out waiting for {}", path.display());
+    }
+
+    fn command_env_map(command: &Command) -> BTreeMap<String, String> {
+        command
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().to_string(),
+                        value.to_string_lossy().to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_runner_command_starts_new_session() -> Result<()> {
+        let tempdir = TestDir::new("manager-detached-runner")?;
+        let script_path = tempdir.path().join("detached-runner.py");
+        let log_path = tempdir.path().join("detached-runner.log");
+        let script = format!(
+            "#!/usr/bin/env python3\nimport os\nimport pathlib\nimport time\n\npath = pathlib.Path(r\"{}\")\npath.write_text(f\"pid={{os.getpid()}} sid={{os.getsid(0)}}\", encoding=\"utf-8\")\ntime.sleep(30)\n",
+            log_path.display()
+        );
+        fs::write(&script_path, script)?;
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+
+        let mut command = Command::new(&script_path);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_background_runner_command(&mut command);
+
+        let mut child = command.spawn()?;
+        let child_pid = child.id().context("detached child pid")? as i32;
+        let content = wait_for_text(&log_path, "sid=")?;
+        let sid = content
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("sid="))
+            .context("session id should be logged")?
+            .parse::<i32>()
+            .context("session id should parse")?;
+        let parent_sid = unsafe { libc::getsid(0) };
+
+        assert_eq!(sid, child_pid);
+        assert_ne!(sid, parent_sid);
+
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        Ok(())
+    }
+
+    #[test]
+    fn background_runner_stderr_log_path_is_session_scoped() {
+        let path =
+            background_runner_stderr_log_path(Path::new("/tmp/ecc-repo"), "session-123");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/ecc-repo/.claude/ecc2/logs/session-123.runner-stderr.log")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detached_creation_flags_include_detach_and_process_group() {
+        assert_eq!(detached_creation_flags(), 0x0000_0008 | 0x0000_0200);
+    }
+
+    fn write_package_manager_project_files(
+        repo_root: &Path,
+        package_manager_field: Option<&str>,
+        lockfile_name: Option<&str>,
+        project_config_package_manager: Option<&str>,
+    ) -> Result<()> {
+        let package_json = match package_manager_field {
+            Some(package_manager_field) => format!(
+                "{{\"name\":\"ecc-smoke\",\"packageManager\":\"{package_manager_field}\"}}\n"
+            ),
+            None => "{\"name\":\"ecc-smoke\"}\n".to_string(),
+        };
+        fs::write(repo_root.join("package.json"), package_json)?;
+        if let Some(lockfile_name) = lockfile_name {
+            fs::write(repo_root.join(lockfile_name), "lockfile\n")?;
+        }
+        if let Some(project_config_package_manager) = project_config_package_manager {
+            let claude_dir = repo_root.join(".claude");
+            fs::create_dir_all(&claude_dir)?;
+            fs::write(
+                claude_dir.join("package-manager.json"),
+                format!("{{\"packageManager\":\"{project_config_package_manager}\"}}\n"),
+            )?;
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn create_session_spawns_process_and_marks_session_running() -> Result<()> {
         let tempdir = TestDir::new("manager-create-session")?;
         let repo_root = tempdir.path().join("repo");
         init_git_repo(&repo_root)?;
+        write_package_manager_project_files(&repo_root, None, Some("pnpm-lock.yaml"), None)?;
 
         let cfg = build_config(tempdir.path());
         let db = StateStore::open(&cfg.db_path)?;
@@ -3552,6 +5248,46 @@ mod tests {
         assert!(log.contains("--print"));
         assert!(log.contains("implement lifecycle"));
         assert!(log.contains(&format!("ECC_SESSION_ID={session_id}")));
+        assert!(log.contains(&format!("CLAUDE_SESSION_ID={session_id}")));
+        assert!(log.contains(&format!(
+            "CLAUDE_PROJECT_DIR={}",
+            repo_root.to_string_lossy()
+        )));
+        assert!(log.contains("CLAUDE_CODE_ENTRYPOINT=cli"));
+        assert!(log.contains("CLAUDE_PACKAGE_MANAGER=pnpm"));
+        assert!(log.contains("CLAUDE_CODE_PACKAGE_MANAGER=pnpm"));
+        assert!(log.contains("ECC_HARNESS=claude"));
+
+        stop_session_with_options(&db, &session_id, false).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_resolves_auto_agent_from_repo_markers() -> Result<()> {
+        let tempdir = TestDir::new("manager-create-session-auto-agent")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(repo_root.join(".codex"))?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_runner, _log_path) = write_fake_claude(tempdir.path())?;
+
+        let session_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "implement lifecycle",
+            "auto",
+            false,
+            &repo_root,
+            &fake_runner,
+        )
+        .await?;
+
+        let session = db
+            .get_session(&session_id)?
+            .context("session should exist")?;
+        assert_eq!(session.agent_type, "codex");
 
         stop_session_with_options(&db, &session_id, false).await?;
         Ok(())
@@ -3585,6 +5321,254 @@ mod tests {
         assert_eq!(session.task_group, "stabilize auth callback");
 
         stop_session_with_options(&db, &session_id, false).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_due_schedules_dispatches_due_tasks_and_advances_next_run() -> Result<()> {
+        let tempdir = TestDir::new("manager-run-due-schedules")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_runner, log_path) = write_fake_claude(tempdir.path())?;
+        let due_at = Utc::now() - Duration::minutes(1);
+
+        let schedule = db.insert_scheduled_task(
+            "*/15 * * * *",
+            "Check backlog health",
+            "claude",
+            None,
+            &repo_root,
+            "ecc-core",
+            "scheduled maintenance",
+            true,
+            due_at,
+        )?;
+
+        let outcomes = run_due_schedules_with_runner_program(&db, &cfg, 10, &fake_runner).await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].schedule_id, schedule.id);
+        assert_eq!(outcomes[0].task, "Check backlog health");
+
+        let session = db
+            .get_session(&outcomes[0].session_id)?
+            .context("scheduled session should exist")?;
+        assert_eq!(session.project, "ecc-core");
+        assert_eq!(session.task_group, "scheduled maintenance");
+
+        let refreshed = db
+            .get_scheduled_task(schedule.id)?
+            .context("scheduled task should still exist")?;
+        assert!(refreshed.last_run_at.is_some());
+        assert!(refreshed.next_run_at > due_at);
+
+        let log = wait_for_file(&log_path)?;
+        assert!(log.contains("Check backlog health"));
+
+        stop_session_with_options(&db, &outcomes[0].session_id, true).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_remote_dispatch_requests_prioritizes_critical_targeted_work() -> Result<()> {
+        let tempdir = TestDir::new("manager-run-remote-dispatch-priority")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_runner, _log_path) = write_fake_claude(tempdir.path())?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "Lead orchestration".to_string(),
+            project: "repo".to_string(),
+            task_group: "Lead orchestration".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let low = create_remote_dispatch_request(
+            &db,
+            &cfg,
+            "Low priority cleanup",
+            Some("lead"),
+            TaskPriority::Low,
+            "claude",
+            None,
+            true,
+            SessionGrouping::default(),
+            "cli",
+            None,
+        )?;
+        let critical = create_remote_dispatch_request(
+            &db,
+            &cfg,
+            "Critical production incident",
+            Some("lead"),
+            TaskPriority::Critical,
+            "claude",
+            None,
+            true,
+            SessionGrouping::default(),
+            "cli",
+            None,
+        )?;
+
+        let outcomes = run_remote_dispatch_requests_with_runner_program(
+            &db,
+            &cfg,
+            db.list_pending_remote_dispatch_requests(1)?,
+            &fake_runner,
+        )
+        .await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].request_id, critical.id);
+        assert!(matches!(
+            outcomes[0].action,
+            RemoteDispatchAction::Assigned(AssignmentAction::Spawned)
+        ));
+
+        let low_request = db
+            .get_remote_dispatch_request(low.id)?
+            .context("low priority request should still exist")?;
+        assert_eq!(
+            low_request.status,
+            crate::session::RemoteDispatchStatus::Pending
+        );
+
+        let critical_request = db
+            .get_remote_dispatch_request(critical.id)?
+            .context("critical request should still exist")?;
+        assert_eq!(
+            critical_request.status,
+            crate::session::RemoteDispatchStatus::Dispatched
+        );
+        assert!(critical_request.result_session_id.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_remote_dispatch_requests_spawns_top_level_session_when_untargeted() -> Result<()> {
+        let tempdir = TestDir::new("manager-run-remote-dispatch-top-level")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_runner, _log_path) = write_fake_claude(tempdir.path())?;
+
+        let request = db.insert_remote_dispatch_request(
+            RemoteDispatchKind::Standard,
+            None,
+            "Remote phone triage",
+            None,
+            TaskPriority::High,
+            "claude",
+            None,
+            &repo_root,
+            "ecc-core",
+            "phone dispatch",
+            true,
+            "http",
+            Some("127.0.0.1"),
+        )?;
+
+        let outcomes = run_remote_dispatch_requests_with_runner_program(
+            &db,
+            &cfg,
+            db.list_pending_remote_dispatch_requests(10)?,
+            &fake_runner,
+        )
+        .await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].request_id, request.id);
+        assert!(matches!(
+            outcomes[0].action,
+            RemoteDispatchAction::SpawnedTopLevel
+        ));
+
+        let request = db
+            .get_remote_dispatch_request(request.id)?
+            .context("remote request should still exist")?;
+        assert_eq!(
+            request.status,
+            crate::session::RemoteDispatchStatus::Dispatched
+        );
+        let session_id = request
+            .result_session_id
+            .clone()
+            .context("spawned top-level request should record a session id")?;
+        let session = db
+            .get_session(&session_id)?
+            .context("spawned session should exist")?;
+        assert_eq!(session.project, "ecc-core");
+        assert_eq!(session.task_group, "phone dispatch");
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_computer_use_remote_dispatch_request_uses_config_defaults() -> Result<()> {
+        let tempdir = TestDir::new("manager-create-computer-use-remote-defaults")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.computer_use_dispatch = crate::config::ComputerUseDispatchConfig {
+            agent: Some("codex".to_string()),
+            profile: None,
+            use_worktree: false,
+            project: Some("ops".to_string()),
+            task_group: Some("remote browser".to_string()),
+        };
+        let db = StateStore::open(&cfg.db_path)?;
+
+        let request = create_computer_use_remote_dispatch_request_in_dir(
+            &db,
+            &cfg,
+            &repo_root,
+            "Open the billing portal and confirm the refund banner",
+            Some("https://ecc.tools/account"),
+            Some("Use the production account flow"),
+            None,
+            TaskPriority::Critical,
+            None,
+            None,
+            None,
+            SessionGrouping::default(),
+            "http_computer_use",
+            Some("127.0.0.1"),
+        )?;
+
+        assert_eq!(request.request_kind, RemoteDispatchKind::ComputerUse);
+        assert_eq!(
+            request.target_url.as_deref(),
+            Some("https://ecc.tools/account")
+        );
+        assert_eq!(request.agent_type, "codex");
+        assert_eq!(request.project, "ops");
+        assert_eq!(request.task_group, "remote browser");
+        assert!(!request.use_worktree);
+        assert!(request.task.contains("Computer-use task."));
+        assert!(request.task.contains("Goal: Open the billing portal"));
+        assert!(request
+            .task
+            .contains("Target URL: https://ecc.tools/account"));
+        assert!(request
+            .task
+            .contains("Context: Use the production account flow"));
         Ok(())
     }
 
@@ -4748,8 +6732,34 @@ mod tests {
         db.insert_session(&build_session("older", SessionState::Running, older))?;
         db.insert_session(&build_session("newer", SessionState::Idle, newer))?;
 
-        let status = get_status(&db, "latest")?;
+        let status = get_status(&db, &cfg, "latest")?;
         assert_eq!(status.session.id, "newer");
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_status_uses_configured_custom_harness_markers() -> Result<()> {
+        let tempdir = TestDir::new("manager-custom-harness-status")?;
+        fs::create_dir_all(tempdir.path().join(".acme"))?;
+        let mut cfg = build_config(tempdir.path());
+        cfg.harness_runners.insert(
+            "acme-runner".to_string(),
+            crate::config::HarnessRunnerConfig {
+                project_markers: vec![PathBuf::from(".acme")],
+                ..Default::default()
+            },
+        );
+        let db = StateStore::open(&cfg.db_path)?;
+        let mut session = build_session("custom", SessionState::Pending, Utc::now());
+        session.agent_type = "".to_string();
+        session.working_dir = tempdir.path().to_path_buf();
+        db.insert_session(&session)?;
+
+        let status = get_status(&db, &cfg, "custom")?;
+        assert_eq!(status.harness.primary, HarnessKind::Unknown);
+        assert_eq!(status.harness.primary_label, "acme-runner");
+        assert_eq!(status.harness.detected_summary(), "acme-runner");
 
         Ok(())
     }
@@ -4786,14 +6796,14 @@ mod tests {
             "task_handoff",
         )?;
 
-        let status = get_status(&db, "parent")?;
+        let status = get_status(&db, &cfg, "parent")?;
         let rendered = status.to_string();
 
         assert!(rendered.contains("Children:"));
         assert!(rendered.contains("child"));
         assert!(rendered.contains("sibling"));
 
-        let child_status = get_status(&db, "child")?;
+        let child_status = get_status(&db, &cfg, "child")?;
         assert_eq!(child_status.parent_session.as_deref(), Some("parent"));
 
         Ok(())
@@ -5542,6 +7552,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn drain_inbox_routes_high_priority_handoff_first() -> Result<()> {
+        let tempdir = TestDir::new("manager-drain-inbox-priority")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.send_message(
+            "planner",
+            "lead",
+            "{\"task\":\"Document cleanup\",\"context\":\"Inbound request\",\"priority\":\"low\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "planner",
+            "lead",
+            "{\"task\":\"Critical auth outage\",\"context\":\"Inbound request\",\"priority\":\"critical\"}",
+            "task_handoff",
+        )?;
+
+        let outcomes = drain_inbox(&db, &cfg, "lead", "claude", true, 1).await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].task, "Critical auth outage");
+        assert_eq!(outcomes[0].action, AssignmentAction::Spawned);
+
+        let unread = db.unread_task_handoffs_for_session("lead", 10)?;
+        assert_eq!(unread.len(), 1);
+        assert!(unread[0].content.contains("Document cleanup"));
+
+        let messages = db.list_messages_for_session(&outcomes[0].session_id, 10)?;
+        assert!(messages.iter().any(|message| {
+            message.msg_type == "task_handoff" && message.content.contains("Critical auth outage")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn auto_dispatch_backlog_routes_multiple_lead_inboxes() -> Result<()> {
         let tempdir = TestDir::new("manager-auto-dispatch")?;
         let repo_root = tempdir.path().join("repo");
@@ -5670,7 +7736,7 @@ mod tests {
         let now = Utc::now();
 
         db.insert_session(&Session {
-            id: "worker".to_string(),
+            id: "lead".to_string(),
             task: "worker task".to_string(),
             project: "workspace".to_string(),
             task_group: "general".to_string(),
@@ -5686,7 +7752,7 @@ mod tests {
         })?;
 
         db.insert_session(&Session {
-            id: "worker-child".to_string(),
+            id: "delegate".to_string(),
             task: "delegate task".to_string(),
             project: "workspace".to_string(),
             task_group: "general".to_string(),
@@ -5702,31 +7768,31 @@ mod tests {
         })?;
 
         db.send_message(
-            "worker",
-            "worker-child",
+            "lead",
+            "delegate",
             "{\"task\":\"seed delegate\",\"context\":\"Delegated from worker\"}",
             "task_handoff",
         )?;
-        let _ = db.mark_messages_read("worker-child")?;
+        let _ = db.mark_messages_read("delegate")?;
 
         db.send_message(
             "planner",
-            "worker",
+            "lead",
             "{\"task\":\"task-a\",\"context\":\"Inbound\"}",
             "task_handoff",
         )?;
         db.send_message(
             "planner",
-            "worker",
+            "lead",
             "{\"task\":\"task-b\",\"context\":\"Inbound\"}",
             "task_handoff",
         )?;
 
         let outcome = coordinate_backlog(&db, &cfg, "claude", true, 10).await?;
 
-        assert_eq!(outcome.remaining_backlog_sessions, 1);
+        assert_eq!(outcome.remaining_backlog_sessions, 2);
         assert_eq!(outcome.remaining_backlog_messages, 2);
-        assert_eq!(outcome.remaining_absorbable_sessions, 0);
+        assert_eq!(outcome.remaining_absorbable_sessions, 1);
         assert_eq!(outcome.remaining_saturated_sessions, 1);
 
         Ok(())
@@ -6005,6 +8071,7 @@ mod tests {
             &crate::comms::MessageType::TaskHandoff {
                 task: "Review src/lib.rs".to_string(),
                 context: "Lead delegated follow-up".to_string(),
+                priority: crate::comms::TaskPriority::Normal,
             },
         )?;
 

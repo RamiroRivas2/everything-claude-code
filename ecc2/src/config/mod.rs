@@ -50,6 +50,16 @@ pub struct ConflictResolutionConfig {
     pub notify_lead: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComputerUseDispatchConfig {
+    pub agent: Option<String>,
+    pub profile: Option<String>,
+    pub use_worktree: bool,
+    pub project: Option<String>,
+    pub task_group: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentProfileConfig {
@@ -77,6 +87,27 @@ pub struct ResolvedAgentProfile {
     pub max_budget_usd: Option<f64>,
     pub token_budget: Option<u64>,
     pub append_system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HarnessRunnerConfig {
+    pub program: String,
+    pub base_args: Vec<String>,
+    pub project_markers: Vec<PathBuf>,
+    pub cwd_flag: Option<String>,
+    pub session_name_flag: Option<String>,
+    pub task_flag: Option<String>,
+    pub model_flag: Option<String>,
+    pub add_dir_flag: Option<String>,
+    pub include_directories_flag: Option<String>,
+    pub allowed_tools_flag: Option<String>,
+    pub disallowed_tools_flag: Option<String>,
+    pub permission_mode_flag: Option<String>,
+    pub max_budget_usd_flag: Option<String>,
+    pub append_system_prompt_flag: Option<String>,
+    pub inline_system_prompt_for_task: bool,
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -198,9 +229,11 @@ pub struct Config {
     pub auto_terminate_stale_sessions: bool,
     pub default_agent: String,
     pub default_agent_profile: Option<String>,
+    pub harness_runners: BTreeMap<String, HarnessRunnerConfig>,
     pub agent_profiles: BTreeMap<String, AgentProfileConfig>,
     pub orchestration_templates: BTreeMap<String, OrchestrationTemplateConfig>,
     pub memory_connectors: BTreeMap<String, MemoryConnectorConfig>,
+    pub computer_use_dispatch: ComputerUseDispatchConfig,
     pub auto_dispatch_unread_handoffs: bool,
     pub auto_dispatch_limit_per_session: usize,
     pub auto_create_worktrees: bool,
@@ -263,9 +296,11 @@ impl Default for Config {
             auto_terminate_stale_sessions: false,
             default_agent: "claude".to_string(),
             default_agent_profile: None,
+            harness_runners: BTreeMap::new(),
             agent_profiles: BTreeMap::new(),
             orchestration_templates: BTreeMap::new(),
             memory_connectors: BTreeMap::new(),
+            computer_use_dispatch: ComputerUseDispatchConfig::default(),
             auto_dispatch_unread_handoffs: false,
             auto_dispatch_limit_per_session: 5,
             auto_create_worktrees: true,
@@ -324,9 +359,34 @@ impl Config {
         self.budget_alert_thresholds.sanitized()
     }
 
+    pub fn computer_use_dispatch_defaults(&self) -> ResolvedComputerUseDispatchConfig {
+        let agent = self
+            .computer_use_dispatch
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.default_agent.clone());
+        let profile = self
+            .computer_use_dispatch
+            .profile
+            .clone()
+            .or_else(|| self.default_agent_profile.clone());
+        ResolvedComputerUseDispatchConfig {
+            agent,
+            profile,
+            use_worktree: self.computer_use_dispatch.use_worktree,
+            project: self.computer_use_dispatch.project.clone(),
+            task_group: self.computer_use_dispatch.task_group.clone(),
+        }
+    }
+
     pub fn resolve_agent_profile(&self, name: &str) -> Result<ResolvedAgentProfile> {
         let mut chain = Vec::new();
         self.resolve_agent_profile_inner(name, &mut chain)
+    }
+
+    pub fn harness_runner(&self, harness: &str) -> Option<&HarnessRunnerConfig> {
+        let key = harness.trim().to_ascii_lowercase();
+        self.harness_runners.get(&key)
     }
 
     pub fn resolve_orchestration_template(
@@ -720,6 +780,50 @@ impl ResolvedAgentProfile {
     }
 }
 
+impl Default for HarnessRunnerConfig {
+    fn default() -> Self {
+        Self {
+            program: String::new(),
+            base_args: Vec::new(),
+            project_markers: Vec::new(),
+            cwd_flag: None,
+            session_name_flag: None,
+            task_flag: None,
+            model_flag: None,
+            add_dir_flag: None,
+            include_directories_flag: None,
+            allowed_tools_flag: None,
+            disallowed_tools_flag: None,
+            permission_mode_flag: None,
+            max_budget_usd_flag: None,
+            append_system_prompt_flag: None,
+            inline_system_prompt_for_task: true,
+            env: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for ComputerUseDispatchConfig {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            profile: None,
+            use_worktree: false,
+            project: None,
+            task_group: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedComputerUseDispatchConfig {
+    pub agent: String,
+    pub profile: Option<String>,
+    pub use_worktree: bool,
+    pub project: Option<String>,
+    pub task_group: Option<String>,
+}
+
 fn merge_unique<T>(base: &mut Vec<T>, additions: &[T])
 where
     T: Clone + PartialEq,
@@ -800,8 +904,8 @@ impl BudgetAlertThresholds {
 #[cfg(test)]
 mod tests {
     use super::{
-        BudgetAlertThresholds, Config, ConflictResolutionConfig, ConflictResolutionStrategy,
-        PaneLayout,
+        BudgetAlertThresholds, ComputerUseDispatchConfig, Config, ConflictResolutionConfig,
+        ConflictResolutionStrategy, PaneLayout, ResolvedComputerUseDispatchConfig,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::BTreeMap;
@@ -1152,6 +1256,42 @@ notify_lead = false
     }
 
     #[test]
+    fn computer_use_dispatch_deserializes_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[computer_use_dispatch]
+agent = "codex"
+profile = "browser"
+use_worktree = true
+project = "ops"
+task_group = "remote browser"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.computer_use_dispatch,
+            ComputerUseDispatchConfig {
+                agent: Some("codex".to_string()),
+                profile: Some("browser".to_string()),
+                use_worktree: true,
+                project: Some("ops".to_string()),
+                task_group: Some("remote browser".to_string()),
+            }
+        );
+        assert_eq!(
+            config.computer_use_dispatch_defaults(),
+            ResolvedComputerUseDispatchConfig {
+                agent: "codex".to_string(),
+                profile: Some("browser".to_string()),
+                use_worktree: true,
+                project: Some("ops".to_string()),
+                task_group: Some("remote browser".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn agent_profiles_resolve_inheritance_and_defaults() {
         let config: Config = toml::from_str(
             r#"
@@ -1208,6 +1348,49 @@ inherits = "a"
         assert!(error
             .to_string()
             .contains("agent profile inheritance cycle"));
+    }
+
+    #[test]
+    fn harness_runners_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[harness_runners.cursor]
+program = "cursor-agent"
+base_args = ["run"]
+project_markers = [".cursor", ".cursor/rules"]
+cwd_flag = "--cwd"
+session_name_flag = "--name"
+task_flag = "--task"
+model_flag = "--model"
+permission_mode_flag = "--permission-mode"
+inline_system_prompt_for_task = true
+
+[harness_runners.cursor.env]
+ECC_HARNESS = "cursor"
+"#,
+        )
+        .unwrap();
+
+        let runner = config.harness_runner("cursor").expect("cursor runner");
+        assert_eq!(runner.program, "cursor-agent");
+        assert_eq!(runner.base_args, vec!["run"]);
+        assert_eq!(
+            runner.project_markers,
+            vec![PathBuf::from(".cursor"), PathBuf::from(".cursor/rules")]
+        );
+        assert_eq!(runner.cwd_flag.as_deref(), Some("--cwd"));
+        assert_eq!(runner.session_name_flag.as_deref(), Some("--name"));
+        assert_eq!(runner.task_flag.as_deref(), Some("--task"));
+        assert_eq!(runner.model_flag.as_deref(), Some("--model"));
+        assert_eq!(
+            runner.permission_mode_flag.as_deref(),
+            Some("--permission-mode")
+        );
+        assert!(runner.inline_system_prompt_for_task);
+        assert_eq!(
+            runner.env.get("ECC_HARNESS").map(String::as_str),
+            Some("cursor")
+        );
     }
 
     #[test]

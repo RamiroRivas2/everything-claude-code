@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::comms;
 use crate::config::Config;
 use crate::observability::{ToolCallEvent, ToolLogEntry, ToolLogPage};
 
@@ -17,8 +18,9 @@ use super::{
     ContextGraphCompactionStats, ContextGraphEntity, ContextGraphEntityDetail,
     ContextGraphObservation, ContextGraphRecallEntry, ContextGraphRelation, ContextGraphSyncStats,
     ContextObservationPriority, DecisionLogEntry, FileActivityAction, FileActivityEntry,
-    HarnessKind, Session, SessionAgentProfile, SessionHarnessInfo, SessionMessage, SessionMetrics,
-    SessionState, WorktreeInfo,
+    HarnessKind, RemoteDispatchKind, RemoteDispatchRequest, RemoteDispatchStatus, ScheduledTask,
+    Session, SessionAgentProfile, SessionHarnessInfo, SessionMessage, SessionMetrics, SessionState,
+    WorktreeInfo,
 };
 
 pub struct StateStore {
@@ -298,6 +300,46 @@ impl StateStore {
                 requested_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cron_expr TEXT NOT NULL,
+                task TEXT NOT NULL,
+                agent_type TEXT NOT NULL,
+                profile_name TEXT,
+                working_dir TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                task_group TEXT NOT NULL DEFAULT '',
+                use_worktree INTEGER NOT NULL DEFAULT 1,
+                last_run_at TEXT,
+                next_run_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_dispatch_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_kind TEXT NOT NULL DEFAULT 'standard',
+                target_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                task TEXT NOT NULL,
+                target_url TEXT,
+                priority INTEGER NOT NULL DEFAULT 1,
+                agent_type TEXT NOT NULL,
+                profile_name TEXT,
+                working_dir TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                task_group TEXT NOT NULL DEFAULT '',
+                use_worktree INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT '',
+                requester TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result_session_id TEXT,
+                result_action TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                dispatched_at TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS conflict_incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conflict_key TEXT NOT NULL UNIQUE,
@@ -360,6 +402,8 @@ impl StateStore {
                 ON conflict_incidents(first_session_id, second_session_id, resolved_at, updated_at);
             CREATE INDEX IF NOT EXISTS idx_pending_worktree_queue_requested_at
                 ON pending_worktree_queue(requested_at, session_id);
+            CREATE INDEX IF NOT EXISTS idx_remote_dispatch_requests_status_priority
+                ON remote_dispatch_requests(status, priority DESC, created_at, id);
 
             INSERT OR IGNORE INTO daemon_activity (id) VALUES (1);
             ",
@@ -639,6 +683,24 @@ impl StateStore {
                 .context("Failed to add last_auto_prune_active_skipped column to daemon_activity table")?;
         }
 
+        if !self.has_column("remote_dispatch_requests", "request_kind")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE remote_dispatch_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'standard'",
+                    [],
+                )
+                .context("Failed to add request_kind column to remote_dispatch_requests table")?;
+        }
+
+        if !self.has_column("remote_dispatch_requests", "target_url")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE remote_dispatch_requests ADD COLUMN target_url TEXT",
+                    [],
+                )
+                .context("Failed to add target_url column to remote_dispatch_requests table")?;
+        }
+
         self.conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_log_hook_event
              ON tool_log(hook_event_id)
@@ -675,15 +737,23 @@ impl StateStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         for (session_id, agent_type, working_dir) in updates {
-            let harness = SessionHarnessInfo::detect(&agent_type, Path::new(&working_dir));
+            let canonical_agent_type = HarnessKind::canonical_agent_type(&agent_type);
+            let harness =
+                SessionHarnessInfo::detect(&canonical_agent_type, Path::new(&working_dir));
             let detected_json =
                 serde_json::to_string(&harness.detected).context("serialize detected harnesses")?;
             self.conn.execute(
                 "UPDATE sessions
-                 SET harness = ?2,
-                     detected_harnesses_json = ?3
+                 SET agent_type = ?2,
+                     harness = ?3,
+                     detected_harnesses_json = ?4
                  WHERE id = ?1",
-                rusqlite::params![session_id, harness.primary.to_string(), detected_json],
+                rusqlite::params![
+                    session_id,
+                    canonical_agent_type,
+                    harness.primary_label,
+                    detected_json
+                ],
             )?;
         }
 
@@ -703,7 +773,7 @@ impl StateStore {
                 session.project,
                 session.task_group,
                 session.agent_type,
-                harness.primary.to_string(),
+                harness.primary_label,
                 detected_json,
                 session.working_dir.to_string_lossy().to_string(),
                 session.state.to_string(),
@@ -1018,6 +1088,278 @@ impl StateStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(rows)
+    }
+
+    pub fn insert_scheduled_task(
+        &self,
+        cron_expr: &str,
+        task: &str,
+        agent_type: &str,
+        profile_name: Option<&str>,
+        working_dir: &Path,
+        project: &str,
+        task_group: &str,
+        use_worktree: bool,
+        next_run_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ScheduledTask> {
+        let now = chrono::Utc::now();
+        self.conn.execute(
+            "INSERT INTO scheduled_tasks (
+                cron_expr,
+                task,
+                agent_type,
+                profile_name,
+                working_dir,
+                project,
+                task_group,
+                use_worktree,
+                next_run_at,
+                created_at,
+                updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                cron_expr,
+                task,
+                agent_type,
+                profile_name,
+                working_dir.display().to_string(),
+                project,
+                task_group,
+                if use_worktree { 1_i64 } else { 0_i64 },
+                next_run_at.to_rfc3339(),
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_scheduled_task(id)?
+            .ok_or_else(|| anyhow::anyhow!("Scheduled task {id} was not found after insert"))
+    }
+
+    pub fn list_scheduled_tasks(&self) -> Result<Vec<ScheduledTask>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, cron_expr, task, agent_type, profile_name, working_dir, project, task_group,
+                    use_worktree, last_run_at, next_run_at, created_at, updated_at
+             FROM scheduled_tasks
+             ORDER BY next_run_at ASC, id ASC",
+        )?;
+
+        let rows = stmt.query_map([], map_scheduled_task)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_due_scheduled_tasks(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<ScheduledTask>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, cron_expr, task, agent_type, profile_name, working_dir, project, task_group,
+                    use_worktree, last_run_at, next_run_at, created_at, updated_at
+             FROM scheduled_tasks
+             WHERE next_run_at <= ?1
+             ORDER BY next_run_at ASC, id ASC
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(
+            rusqlite::params![now.to_rfc3339(), limit as i64],
+            map_scheduled_task,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_scheduled_task(&self, schedule_id: i64) -> Result<Option<ScheduledTask>> {
+        self.conn
+            .query_row(
+                "SELECT id, cron_expr, task, agent_type, profile_name, working_dir, project, task_group,
+                        use_worktree, last_run_at, next_run_at, created_at, updated_at
+                 FROM scheduled_tasks
+                 WHERE id = ?1",
+                [schedule_id],
+                map_scheduled_task,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_scheduled_task(&self, schedule_id: i64) -> Result<usize> {
+        self.conn
+            .execute("DELETE FROM scheduled_tasks WHERE id = ?1", [schedule_id])
+            .map_err(Into::into)
+    }
+
+    pub fn record_scheduled_task_run(
+        &self,
+        schedule_id: i64,
+        last_run_at: chrono::DateTime<chrono::Utc>,
+        next_run_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_tasks
+             SET last_run_at = ?2, next_run_at = ?3, updated_at = ?4
+             WHERE id = ?1",
+            rusqlite::params![
+                schedule_id,
+                last_run_at.to_rfc3339(),
+                next_run_at.to_rfc3339(),
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_remote_dispatch_request(
+        &self,
+        request_kind: RemoteDispatchKind,
+        target_session_id: Option<&str>,
+        task: &str,
+        target_url: Option<&str>,
+        priority: crate::comms::TaskPriority,
+        agent_type: &str,
+        profile_name: Option<&str>,
+        working_dir: &Path,
+        project: &str,
+        task_group: &str,
+        use_worktree: bool,
+        source: &str,
+        requester: Option<&str>,
+    ) -> Result<RemoteDispatchRequest> {
+        let now = chrono::Utc::now();
+        self.conn.execute(
+            "INSERT INTO remote_dispatch_requests (
+                request_kind,
+                target_session_id,
+                task,
+                target_url,
+                priority,
+                agent_type,
+                profile_name,
+                working_dir,
+                project,
+                task_group,
+                use_worktree,
+                source,
+                requester,
+                status,
+                created_at,
+                updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14, ?15)",
+            rusqlite::params![
+                request_kind.to_string(),
+                target_session_id,
+                task,
+                target_url,
+                task_priority_db_value(priority),
+                agent_type,
+                profile_name,
+                working_dir.display().to_string(),
+                project,
+                task_group,
+                if use_worktree { 1_i64 } else { 0_i64 },
+                source,
+                requester,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_remote_dispatch_request(id)?.ok_or_else(|| {
+            anyhow::anyhow!("Remote dispatch request {id} was not found after insert")
+        })
+    }
+
+    pub fn list_remote_dispatch_requests(
+        &self,
+        include_processed: bool,
+        limit: usize,
+    ) -> Result<Vec<RemoteDispatchRequest>> {
+        let sql = if include_processed {
+            "SELECT id, request_kind, target_session_id, task, target_url, priority, agent_type, profile_name, working_dir,
+                    project, task_group, use_worktree, source, requester, status,
+                    result_session_id, result_action, error, created_at, updated_at, dispatched_at
+             FROM remote_dispatch_requests
+             ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END ASC,
+                      priority DESC, created_at ASC, id ASC
+             LIMIT ?1"
+        } else {
+            "SELECT id, request_kind, target_session_id, task, target_url, priority, agent_type, profile_name, working_dir,
+                    project, task_group, use_worktree, source, requester, status,
+                    result_session_id, result_action, error, created_at, updated_at, dispatched_at
+             FROM remote_dispatch_requests
+             WHERE status = 'pending'
+             ORDER BY priority DESC, created_at ASC, id ASC
+             LIMIT ?1"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([limit as i64], map_remote_dispatch_request)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_pending_remote_dispatch_requests(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemoteDispatchRequest>> {
+        self.list_remote_dispatch_requests(false, limit)
+    }
+
+    pub fn get_remote_dispatch_request(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<RemoteDispatchRequest>> {
+        self.conn
+            .query_row(
+                "SELECT id, request_kind, target_session_id, task, target_url, priority, agent_type, profile_name, working_dir,
+                        project, task_group, use_worktree, source, requester, status,
+                        result_session_id, result_action, error, created_at, updated_at, dispatched_at
+                 FROM remote_dispatch_requests
+                 WHERE id = ?1",
+                [request_id],
+                map_remote_dispatch_request,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn record_remote_dispatch_success(
+        &self,
+        request_id: i64,
+        result_session_id: Option<&str>,
+        result_action: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now();
+        self.conn.execute(
+            "UPDATE remote_dispatch_requests
+             SET status = 'dispatched',
+                 result_session_id = ?2,
+                 result_action = ?3,
+                 error = NULL,
+                 dispatched_at = ?4,
+                 updated_at = ?4
+             WHERE id = ?1",
+            rusqlite::params![
+                request_id,
+                result_session_id,
+                result_action,
+                now.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_remote_dispatch_failure(&self, request_id: i64, error: &str) -> Result<()> {
+        let now = chrono::Utc::now();
+        self.conn.execute(
+            "UPDATE remote_dispatch_requests
+             SET status = 'failed',
+                 error = ?2,
+                 updated_at = ?3
+             WHERE id = ?1",
+            rusqlite::params![request_id, error, now.to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     pub fn update_metrics(&self, session_id: &str, metrics: &SessionMetrics) -> Result<()> {
@@ -1619,16 +1961,17 @@ impl StateStore {
         let harnesses = stmt
             .query_map([], |row| {
                 let session_id: String = row.get(0)?;
-                let primary = HarnessKind::from_db_value(&row.get::<_, String>(1)?);
+                let harness_label: String = row.get(1)?;
                 let detected = serde_json::from_str::<Vec<HarnessKind>>(&row.get::<_, String>(2)?)
                     .unwrap_or_default();
                 let agent_type: String = row.get(3)?;
                 let working_dir = PathBuf::from(row.get::<_, String>(4)?);
-                let info = if primary == HarnessKind::Unknown && detected.is_empty() {
-                    SessionHarnessInfo::detect(&agent_type, &working_dir)
-                } else {
-                    SessionHarnessInfo { primary, detected }
-                };
+                let info = SessionHarnessInfo::from_persisted(
+                    &harness_label,
+                    &agent_type,
+                    &working_dir,
+                    detected,
+                );
                 Ok((session_id, info))
             })?
             .collect::<std::result::Result<HashMap<_, _>, _>>()?;
@@ -1644,16 +1987,17 @@ impl StateStore {
         )?;
 
         stmt.query_row([session_id], |row| {
-            let primary = HarnessKind::from_db_value(&row.get::<_, String>(0)?);
+            let harness_label: String = row.get(0)?;
             let detected = serde_json::from_str::<Vec<HarnessKind>>(&row.get::<_, String>(1)?)
                 .unwrap_or_default();
             let agent_type: String = row.get(2)?;
             let working_dir = PathBuf::from(row.get::<_, String>(3)?);
-            let info = if primary == HarnessKind::Unknown && detected.is_empty() {
-                SessionHarnessInfo::detect(&agent_type, &working_dir)
-            } else {
-                SessionHarnessInfo { primary, detected }
-            };
+            let info = SessionHarnessInfo::from_persisted(
+                &harness_label,
+                &agent_type,
+                &working_dir,
+                detected,
+            );
             Ok(info)
         })
         .optional()
@@ -1877,11 +2221,10 @@ impl StateStore {
             "SELECT id, from_session, to_session, content, msg_type, read, timestamp
              FROM messages
              WHERE to_session = ?1 AND msg_type = 'task_handoff' AND read = 0
-             ORDER BY id ASC
-             LIMIT ?2",
+             ORDER BY id ASC",
         )?;
 
-        let messages = stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
+        let messages = stmt.query_map(rusqlite::params![session_id], |row| {
             let timestamp: String = row.get(6)?;
 
             Ok(SessionMessage {
@@ -1897,7 +2240,16 @@ impl StateStore {
             })
         })?;
 
-        messages.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut messages = messages.collect::<Result<Vec<_>, _>>()?;
+        messages.sort_by(|left, right| {
+            let left_priority = comms::handoff_priority(&left.content);
+            let right_priority = comms::handoff_priority(&right.content);
+            Reverse(left_priority)
+                .cmp(&Reverse(right_priority))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        messages.truncate(limit);
+        Ok(messages)
     }
 
     pub fn unread_task_handoff_count(&self, session_id: &str) -> Result<usize> {
@@ -1915,19 +2267,49 @@ impl StateStore {
 
     pub fn unread_task_handoff_targets(&self, limit: usize) -> Result<Vec<(String, usize)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT to_session, COUNT(*) as unread_count
+            "SELECT to_session, content, id
              FROM messages
              WHERE msg_type = 'task_handoff' AND read = 0
-             GROUP BY to_session
-             ORDER BY unread_count DESC, MAX(id) ASC
-             LIMIT ?1",
+             ORDER BY id ASC",
         )?;
 
-        let targets = stmt.query_map(rusqlite::params![limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        let targets = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
+        let mut aggregated: HashMap<String, (usize, comms::TaskPriority, i64)> = HashMap::new();
+        for (to_session, content, id) in targets.collect::<Result<Vec<_>, _>>()? {
+            let priority = comms::handoff_priority(&content);
+            aggregated
+                .entry(to_session)
+                .and_modify(|entry| {
+                    entry.0 += 1;
+                    if priority > entry.1 {
+                        entry.1 = priority;
+                    }
+                    if id < entry.2 {
+                        entry.2 = id;
+                    }
+                })
+                .or_insert((1, priority, id));
+        }
 
-        targets.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut targets = aggregated.into_iter().collect::<Vec<_>>();
+        targets.sort_by(|(left_session, left), (right_session, right)| {
+            Reverse(left.1)
+                .cmp(&Reverse(right.1))
+                .then_with(|| Reverse(left.0).cmp(&Reverse(right.0)))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left_session.cmp(right_session))
+        });
+        targets.truncate(limit);
+        Ok(targets
+            .into_iter()
+            .map(|(session_id, (count, _, _))| (session_id, count))
+            .collect())
     }
 
     pub fn mark_messages_read(&self, session_id: &str) -> Result<usize> {
@@ -3518,6 +3900,63 @@ fn map_conflict_incident(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConflictIn
     })
 }
 
+fn map_scheduled_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask> {
+    let last_run_at = row
+        .get::<_, Option<String>>(9)?
+        .map(|value| parse_store_timestamp(value, 9))
+        .transpose()?;
+    let next_run_at = parse_store_timestamp(row.get::<_, String>(10)?, 10)?;
+    let created_at = parse_store_timestamp(row.get::<_, String>(11)?, 11)?;
+    let updated_at = parse_store_timestamp(row.get::<_, String>(12)?, 12)?;
+    Ok(ScheduledTask {
+        id: row.get(0)?,
+        cron_expr: row.get(1)?,
+        task: row.get(2)?,
+        agent_type: row.get(3)?,
+        profile_name: normalize_optional_string(row.get(4)?),
+        working_dir: PathBuf::from(row.get::<_, String>(5)?),
+        project: row.get(6)?,
+        task_group: row.get(7)?,
+        use_worktree: row.get::<_, i64>(8)? != 0,
+        last_run_at,
+        next_run_at,
+        created_at,
+        updated_at,
+    })
+}
+
+fn map_remote_dispatch_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteDispatchRequest> {
+    let created_at = parse_store_timestamp(row.get::<_, String>(18)?, 18)?;
+    let updated_at = parse_store_timestamp(row.get::<_, String>(19)?, 19)?;
+    let dispatched_at = row
+        .get::<_, Option<String>>(20)?
+        .map(|value| parse_store_timestamp(value, 20))
+        .transpose()?;
+    Ok(RemoteDispatchRequest {
+        id: row.get(0)?,
+        request_kind: RemoteDispatchKind::from_db_value(&row.get::<_, String>(1)?),
+        target_session_id: normalize_optional_string(row.get(2)?),
+        task: row.get(3)?,
+        target_url: normalize_optional_string(row.get(4)?),
+        priority: task_priority_from_db_value(row.get::<_, i64>(5)?),
+        agent_type: row.get(6)?,
+        profile_name: normalize_optional_string(row.get(7)?),
+        working_dir: PathBuf::from(row.get::<_, String>(8)?),
+        project: row.get(9)?,
+        task_group: row.get(10)?,
+        use_worktree: row.get::<_, i64>(11)? != 0,
+        source: row.get(12)?,
+        requester: normalize_optional_string(row.get(13)?),
+        status: RemoteDispatchStatus::from_db_value(&row.get::<_, String>(14)?),
+        result_session_id: normalize_optional_string(row.get(15)?),
+        result_action: normalize_optional_string(row.get(16)?),
+        error: normalize_optional_string(row.get(17)?),
+        created_at,
+        updated_at,
+        dispatched_at,
+    })
+}
+
 fn parse_timestamp_column(
     value: String,
     index: usize,
@@ -3558,6 +3997,24 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 
 fn default_input_params_json() -> String {
     "{}".to_string()
+}
+
+fn task_priority_db_value(priority: crate::comms::TaskPriority) -> i64 {
+    match priority {
+        crate::comms::TaskPriority::Low => 0,
+        crate::comms::TaskPriority::Normal => 1,
+        crate::comms::TaskPriority::High => 2,
+        crate::comms::TaskPriority::Critical => 3,
+    }
+}
+
+fn task_priority_from_db_value(value: i64) -> crate::comms::TaskPriority {
+    match value {
+        0 => crate::comms::TaskPriority::Low,
+        2 => crate::comms::TaskPriority::High,
+        3 => crate::comms::TaskPriority::Critical,
+        _ => crate::comms::TaskPriority::Normal,
+    }
 }
 
 fn infer_file_activity_action(tool_name: &str) -> FileActivityAction {
@@ -3968,7 +4425,7 @@ mod tests {
                 "Backfill harness metadata",
                 "ecc",
                 "legacy",
-                "claude",
+                "gemini-cli",
                 repo_root.display().to_string(),
                 now,
             ],
@@ -3976,11 +4433,46 @@ mod tests {
         drop(conn);
 
         let db = StateStore::open(&db_path)?;
+        let session = db
+            .get_session("sess-legacy")?
+            .expect("legacy row should still exist");
+        assert_eq!(session.agent_type, "gemini");
         let harness = db
             .get_session_harness_info("sess-legacy")?
             .expect("legacy row should be backfilled");
-        assert_eq!(harness.primary, HarnessKind::Claude);
+        assert_eq!(harness.primary, HarnessKind::Gemini);
+        assert_eq!(harness.primary_label, "gemini");
         assert_eq!(harness.detected, vec![HarnessKind::Codex]);
+        Ok(())
+    }
+
+    #[test]
+    fn insert_session_preserves_custom_harness_label_for_unknown_agent_types() -> Result<()> {
+        let tempdir = TestDir::new("store-custom-harness-label")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "sess-custom".to_string(),
+            task: "Run custom harness".to_string(),
+            project: "ecc".to_string(),
+            task_group: "compat".to_string(),
+            agent_type: "acme-runner".to_string(),
+            working_dir: PathBuf::from(tempdir.path()),
+            state: SessionState::Pending,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let harness = db
+            .get_session_harness_info("sess-custom")?
+            .expect("custom session should have harness info");
+        assert_eq!(harness.primary, HarnessKind::Unknown);
+        assert_eq!(harness.primary_label, "acme-runner");
         Ok(())
     }
 
@@ -5046,6 +5538,49 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_tasks_round_trip_and_advance_runs() -> Result<()> {
+        let tempdir = TestDir::new("store-scheduled-tasks")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+        let due_next_run = now - ChronoDuration::minutes(1);
+
+        let inserted = db.insert_scheduled_task(
+            "*/15 * * * *",
+            "Check backlog health",
+            "claude",
+            Some("planner"),
+            tempdir.path(),
+            "ecc-core",
+            "scheduled maintenance",
+            true,
+            due_next_run,
+        )?;
+
+        let listed = db.list_scheduled_tasks()?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, inserted.id);
+        assert_eq!(listed[0].profile_name.as_deref(), Some("planner"));
+
+        let due = db.list_due_scheduled_tasks(now, 10)?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, inserted.id);
+
+        let advanced_next_run = now + ChronoDuration::minutes(15);
+        db.record_scheduled_task_run(inserted.id, now, advanced_next_run)?;
+
+        let refreshed = db
+            .get_scheduled_task(inserted.id)?
+            .context("scheduled task should still exist")?;
+        assert_eq!(refreshed.last_run_at, Some(now));
+        assert_eq!(refreshed.next_run_at, advanced_next_run);
+
+        assert_eq!(db.delete_scheduled_task(inserted.id)?, 1);
+        assert!(db.get_scheduled_task(inserted.id)?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
     fn context_graph_detail_includes_incoming_and_outgoing_relations() -> Result<()> {
         let tempdir = TestDir::new("store-context-relations")?;
         let db = StateStore::open(&tempdir.path().join("state.db"))?;
@@ -5509,7 +6044,19 @@ mod tests {
         db.send_message(
             "planner",
             "worker-3",
-            "{\"task\":\"Check billing\",\"context\":\"Delegated from planner\"}",
+            "{\"task\":\"Check billing\",\"context\":\"Delegated from planner\",\"priority\":\"high\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "planner",
+            "worker-4",
+            "{\"task\":\"Low priority follow-up\",\"context\":\"Delegated from planner\",\"priority\":\"low\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "planner",
+            "worker-4",
+            "{\"task\":\"Critical production incident\",\"context\":\"Delegated from planner\",\"priority\":\"critical\"}",
             "task_handoff",
         )?;
 
@@ -5519,12 +6066,28 @@ mod tests {
         );
         assert_eq!(
             db.delegated_children("planner", 10)?,
-            vec!["worker-3".to_string(), "worker-2".to_string(),]
+            vec![
+                "worker-4".to_string(),
+                "worker-3".to_string(),
+                "worker-2".to_string(),
+            ]
         );
         assert_eq!(
             db.unread_task_handoff_targets(10)?,
-            vec![("worker-2".to_string(), 1), ("worker-3".to_string(), 1),]
+            vec![
+                ("worker-4".to_string(), 2),
+                ("worker-3".to_string(), 1),
+                ("worker-2".to_string(), 1),
+            ]
         );
+        let worker_4_handoffs = db.unread_task_handoffs_for_session("worker-4", 10)?;
+        assert_eq!(worker_4_handoffs.len(), 2);
+        assert!(worker_4_handoffs[0]
+            .content
+            .contains("Critical production incident"));
+        assert!(worker_4_handoffs[1]
+            .content
+            .contains("Low priority follow-up"));
 
         let planner_entities = db.list_context_entities(Some("planner"), Some("session"), 10)?;
         assert_eq!(planner_entities.len(), 1);
