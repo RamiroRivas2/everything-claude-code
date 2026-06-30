@@ -16,6 +16,7 @@ PLUGIN_JSON=".claude-plugin/plugin.json"
 MARKETPLACE_JSON=".claude-plugin/marketplace.json"
 CODEX_MARKETPLACE_JSON=".agents/plugins/marketplace.json"
 CODEX_PLUGIN_JSON=".codex-plugin/plugin.json"
+CODEX_MARKETPLACE_PLUGIN_JSON="plugins/ecc/.codex-plugin/plugin.json"
 OPENCODE_PACKAGE_JSON=".opencode/package.json"
 OPENCODE_PACKAGE_LOCK_JSON=".opencode/package-lock.json"
 OPENCODE_ECC_HOOKS_PLUGIN=".opencode/plugins/ecc-hooks.ts"
@@ -126,10 +127,10 @@ update_readme_version_row() {
     const current = fs.readFileSync(file, "utf8");
     const updated = current.replace(
       new RegExp(
-        `^\\| \\*\\*${escape(label)}\\*\\* \\| ${escape(firstCol)} \\| ${escape(secondCol)} \\| ${escape(thirdCol)} \\| [0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)? \\|$`,
+        `^(\\| \\*\\*${escape(label)}\\*\\* \\| ${escape(firstCol)} \\| ${escape(secondCol)} \\| ${escape(thirdCol)} \\| )[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?( \\|(?: [^|]+ \\|)*)$`,
         "m"
       ),
-      `| **${label}** | ${firstCol} | ${secondCol} | ${thirdCol} | ${version} |`
+      (_, prefix, suffix) => `${prefix}${version}${suffix}`
     );
     if (updated === current) {
       console.error(`Error: could not update README version row in ${file}`);
@@ -270,6 +271,7 @@ update_version "$PLUGIN_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSIO
 update_version "$MARKETPLACE_JSON" "0,/\"version\": *\"[^\"]*\"/s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
 update_codex_marketplace_version
 update_version "$CODEX_PLUGIN_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
+update_version "$CODEX_MARKETPLACE_PLUGIN_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
 update_version "$OPENCODE_PACKAGE_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
 update_package_lock_version "$OPENCODE_PACKAGE_LOCK_JSON"
 update_opencode_hook_banner_version

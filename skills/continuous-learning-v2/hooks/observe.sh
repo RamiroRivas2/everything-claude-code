@@ -12,8 +12,20 @@
 
 set -e
 
-# Hook phase from CLI argument: "pre" (PreToolUse) or "post" (PostToolUse)
-HOOK_PHASE="${1:-post}"
+# Hook phase from CLI argument: "pre" (PreToolUse) or "post" (PostToolUse).
+# Manual settings.json installs can call this script without the plugin
+# wrapper's positional phase argument, but Claude Code still exposes the hook
+# event name in CLAUDE_HOOK_EVENT_NAME.  Fall back to that env var before
+# defaulting to post so manually registered PreToolUse hooks are recorded as
+# tool_start instead of being silently misclassified as tool_complete.
+HOOK_PHASE="${1:-}"
+if [ -z "$HOOK_PHASE" ]; then
+  case "${CLAUDE_HOOK_EVENT_NAME:-}" in
+    PreToolUse|pretooluse|pre_tool_use|pre) HOOK_PHASE="pre" ;;
+    PostToolUse|posttooluse|post_tool_use|post) HOOK_PHASE="post" ;;
+    *) HOOK_PHASE="post" ;;
+  esac
+fi
 
 # ─────────────────────────────────────────────
 # Read stdin first (before project detection)
@@ -104,7 +116,13 @@ except(KeyError, TypeError, ValueError):
 # If cwd was provided in stdin, use it for project detection
 if [ -n "$STDIN_CWD" ] && [ -d "$STDIN_CWD" ]; then
   _GIT_ROOT=$(git -C "$STDIN_CWD" rev-parse --show-toplevel 2>/dev/null || true)
-  export CLAUDE_PROJECT_DIR="${_GIT_ROOT:-$STDIN_CWD}"
+  if [ -n "$_GIT_ROOT" ]; then
+    export CLAUDE_PROJECT_DIR="$_GIT_ROOT"
+    unset CLV2_NO_PROJECT
+  else
+    unset CLAUDE_PROJECT_DIR
+    export CLV2_NO_PROJECT=1
+  fi
 fi
 
 # ─────────────────────────────────────────────
@@ -115,7 +133,9 @@ fi
 # Sourcing detect-project.sh creates project-scoped directories and updates
 # projects.json, so automated sessions must return before that point.
 
-CONFIG_DIR="${HOME}/.claude/homunculus"
+# shellcheck disable=SC1091
+. "$(dirname "$0")/../scripts/lib/homunculus-dir.sh"
+CONFIG_DIR="$(_ecc_resolve_homunculus_dir)"
 
 # Skip if disabled (check both default and CLV2_CONFIG-derived locations)
 if [ -f "$CONFIG_DIR/disabled" ]; then
@@ -135,7 +155,7 @@ fi
 # Non-interactive SDK automation is still filtered by Layers 2-5 below
 # (ECC_HOOK_PROFILE=minimal, ECC_SKIP_OBSERVE=1, agent_id, path exclusions).
 case "${CLAUDE_CODE_ENTRYPOINT:-cli}" in
-  cli|sdk-ts|claude-desktop) ;;
+  cli|sdk-ts|claude-desktop|claude-vscode) ;;
   *) exit 0 ;;
 esac
 
@@ -248,12 +268,25 @@ if [ "$PARSED_OK" != "True" ]; then
   echo "$INPUT_JSON" | "$PYTHON_CMD" -c '
 import json, sys, os, re
 
+# Linear-time secret matcher. Bounded quantifiers and a fixed set of auth
+# schemes (instead of a generic [A-Za-z]+\s+ that overlapped the value class)
+# prevent the catastrophic backtracking that pegged python at 100% CPU (#2278).
 _SECRET_RE = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|authorization|credentials?|auth)"
-    r"""(["'"'"'\s:=]+)"""
-    r"([A-Za-z]+\s+)?"
-    r"([A-Za-z0-9_\-/.+=]{8,})"
+    r"""(["'"'"'\s:=]{1,8})"""
+    r"((?:bearer|basic|token|bot)\s+)?"
+    r"([A-Za-z0-9_\-/.+=]{8,256})"
 )
+
+import signal
+def _ecc_bail(*_):
+    print("[observe] SIGALRM timeout: parse-error fallback observation dropped before write (#2300)", file=sys.stderr)
+    sys.exit(0)
+try:
+    signal.signal(signal.SIGALRM, _ecc_bail)
+    signal.alarm(8)  # self-terminate before the async hook 10s timeout can orphan us (#2278)
+except Exception:
+    pass
 
 raw = sys.stdin.read()[:2000]
 raw = _SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + (m.group(3) or "") + "[REDACTED]", raw)
@@ -282,6 +315,16 @@ export TIMESTAMP="$timestamp"
 
 echo "$PARSED" | "$PYTHON_CMD" -c '
 import json, sys, os, re
+import signal
+
+def _ecc_bail(*_):
+    print("[observe] SIGALRM timeout: in-flight observation dropped before write (#2300)", file=sys.stderr)
+    sys.exit(0)
+try:
+    signal.signal(signal.SIGALRM, _ecc_bail)
+    signal.alarm(8)  # self-terminate before the async hook 10s timeout can orphan us (#2278)
+except Exception:
+    pass
 
 parsed = json.load(sys.stdin)
 observation = {
@@ -295,11 +338,14 @@ observation = {
 
 # Scrub secrets: match common key=value, key: value, and key"value patterns
 # Includes optional auth scheme (e.g., "Bearer", "Basic") before token
+# Linear-time secret matcher. Bounded quantifiers and a fixed set of auth
+# schemes (instead of a generic [A-Za-z]+\s+ that overlapped the value class)
+# prevent the catastrophic backtracking that pegged python at 100% CPU (#2278).
 _SECRET_RE = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|authorization|credentials?|auth)"
-    r"""(["'"'"'\s:=]+)"""
-    r"([A-Za-z]+\s+)?"
-    r"([A-Za-z0-9_\-/.+=]{8,})"
+    r"""(["'"'"'\s:=]{1,8})"""
+    r"((?:bearer|basic|token|bot)\s+)?"
+    r"([A-Za-z0-9_\-/.+=]{8,256})"
 )
 
 def scrub(val):
@@ -319,6 +365,19 @@ print(json.dumps(observation))
 # Use flock for atomic check-then-act to prevent race conditions
 # Fallback for macOS (no flock): use lockfile or skip
 LAZY_START_LOCK="${PROJECT_DIR}/.observer-start.lock"
+_REMOVE_FILE_IF_PRESENT() {
+  local target="$1"
+  if [ -n "$target" ] && [ -e "$target" ]; then
+    rm -- "$target" 2>/dev/null || true
+  fi
+}
+
+_START_OBSERVER_LOGGED() {
+  local bootstrap_log="${PROJECT_DIR}/observer-start.log"
+  mkdir -p "$PROJECT_DIR"
+  "${SKILL_ROOT}/agents/start-observer.sh" start >> "$bootstrap_log" 2>&1 || true
+}
+
 _CHECK_OBSERVER_RUNNING() {
   local pid_file="$1"
   if [ -f "$pid_file" ]; then
@@ -327,7 +386,7 @@ _CHECK_OBSERVER_RUNNING() {
     # Validate PID is a positive integer (>1) to prevent signaling invalid targets
     case "$pid" in
       ''|*[!0-9]*|0|1)
-        rm -f "$pid_file" 2>/dev/null || true
+        _REMOVE_FILE_IF_PRESENT "$pid_file"
         return 1
         ;;
     esac
@@ -335,7 +394,7 @@ _CHECK_OBSERVER_RUNNING() {
       return 0  # Process is alive
     fi
     # Stale PID file - remove it
-    rm -f "$pid_file" 2>/dev/null || true
+    _REMOVE_FILE_IF_PRESENT "$pid_file"
   fi
   return 1  # No PID file or process dead
 }
@@ -344,10 +403,12 @@ if [ -f "${CONFIG_DIR}/disabled" ]; then
   OBSERVER_ENABLED=false
 else
   OBSERVER_ENABLED=false
-  CONFIG_FILE="${SKILL_ROOT}/config.json"
-  # Allow CLV2_CONFIG override
   if [ -n "${CLV2_CONFIG:-}" ]; then
     CONFIG_FILE="$CLV2_CONFIG"
+  elif [ -f "${CONFIG_DIR}/config.json" ]; then
+    CONFIG_FILE="${CONFIG_DIR}/config.json"
+  else
+    CONFIG_FILE="${SKILL_ROOT}/config.json"
   fi
   # Use effective config path for both existence check and reading
   EFFECTIVE_CONFIG="$CONFIG_FILE"
@@ -380,7 +441,7 @@ if [ "$OBSERVER_ENABLED" = "true" ]; then
         _CHECK_OBSERVER_RUNNING "${PROJECT_DIR}/.observer.pid" || true
         _CHECK_OBSERVER_RUNNING "${CONFIG_DIR}/.observer.pid" || true
         if [ ! -f "${PROJECT_DIR}/.observer.pid" ] && [ ! -f "${CONFIG_DIR}/.observer.pid" ]; then
-          nohup "${SKILL_ROOT}/agents/start-observer.sh" start >/dev/null 2>&1 &
+          _START_OBSERVER_LOGGED
         fi
       ) 9>"$LAZY_START_LOCK"
     else
@@ -388,14 +449,14 @@ if [ "$OBSERVER_ENABLED" = "true" ]; then
       if command -v lockfile >/dev/null 2>&1; then
         # Use subshell to isolate exit and add trap for cleanup
         (
-          trap 'rm -f "$LAZY_START_LOCK" 2>/dev/null || true' EXIT
+          trap '_REMOVE_FILE_IF_PRESENT "$LAZY_START_LOCK"' EXIT
           lockfile -r 1 -l 30 "$LAZY_START_LOCK" 2>/dev/null || exit 0
           _CHECK_OBSERVER_RUNNING "${PROJECT_DIR}/.observer.pid" || true
           _CHECK_OBSERVER_RUNNING "${CONFIG_DIR}/.observer.pid" || true
           if [ ! -f "${PROJECT_DIR}/.observer.pid" ] && [ ! -f "${CONFIG_DIR}/.observer.pid" ]; then
-            nohup "${SKILL_ROOT}/agents/start-observer.sh" start >/dev/null 2>&1 &
+            _START_OBSERVER_LOGGED
           fi
-          rm -f "$LAZY_START_LOCK" 2>/dev/null || true
+          _REMOVE_FILE_IF_PRESENT "$LAZY_START_LOCK"
         )
       else
         # POSIX fallback: mkdir is atomic -- fails if dir already exists
@@ -405,7 +466,7 @@ if [ "$OBSERVER_ENABLED" = "true" ]; then
           _CHECK_OBSERVER_RUNNING "${PROJECT_DIR}/.observer.pid" || true
           _CHECK_OBSERVER_RUNNING "${CONFIG_DIR}/.observer.pid" || true
           if [ ! -f "${PROJECT_DIR}/.observer.pid" ] && [ ! -f "${CONFIG_DIR}/.observer.pid" ]; then
-            nohup "${SKILL_ROOT}/agents/start-observer.sh" start >/dev/null 2>&1 &
+            _START_OBSERVER_LOGGED
           fi
         )
       fi
@@ -418,21 +479,82 @@ fi
 # which caused runaway parallel Claude analysis processes.
 SIGNAL_EVERY_N="${ECC_OBSERVER_SIGNAL_EVERY_N:-20}"
 SIGNAL_COUNTER_FILE="${PROJECT_DIR}/.observer-signal-counter"
+SIGNAL_COUNTER_LOCK="${SIGNAL_COUNTER_FILE}.lock"
 ACTIVITY_FILE="${PROJECT_DIR}/.observer-last-activity"
 
 touch "$ACTIVITY_FILE" 2>/dev/null || true
 
+# Serialize the throttle-counter read-modify-write. observe.sh runs on every
+# tool call (which can fire every second), so concurrent invocations previously
+# raced on this counter: both read the same value, both incremented, and one
+# write was lost, signaling the observer at unpredictable intervals (#2296).
+# Prefer flock (a kernel advisory lock the OS releases automatically if the hook
+# is killed); fall back to the atomic mkdir lock this script already uses for
+# the lazy-start path above. Both wrap the same read-modify-write below.
 should_signal=0
-if [ -f "$SIGNAL_COUNTER_FILE" ]; then
-  counter=$(cat "$SIGNAL_COUNTER_FILE" 2>/dev/null || echo 0)
-  counter=$((counter + 1))
-  if [ "$counter" -ge "$SIGNAL_EVERY_N" ]; then
-    should_signal=1
-    counter=0
+
+_ecc_bump_signal_counter() {
+  if [ -f "$SIGNAL_COUNTER_FILE" ]; then
+    counter=$(cat "$SIGNAL_COUNTER_FILE" 2>/dev/null || echo 0)
+    # Guard against a corrupt counter file: a non-integer value would abort the
+    # hook under `set -e` at the arithmetic below.
+    case "$counter" in
+      ''|*[!0-9]*) counter=0 ;;
+    esac
+    counter=$((counter + 1))
+    if [ "$counter" -ge "$SIGNAL_EVERY_N" ]; then
+      should_signal=1
+      counter=0
+    fi
+    echo "$counter" > "$SIGNAL_COUNTER_FILE"
+  else
+    echo "1" > "$SIGNAL_COUNTER_FILE"
   fi
-  echo "$counter" > "$SIGNAL_COUNTER_FILE"
+}
+
+if command -v flock >/dev/null 2>&1 && exec 8>"$SIGNAL_COUNTER_LOCK" 2>/dev/null; then
+  # flock is auto-released when fd 8 closes or the process dies, so there is no
+  # stale lock and no lost increment. Use a bounded -w wait so the hook never
+  # blocks indefinitely, and only bump the counter while the lock is held -- on
+  # a timeout we skip the tick rather than doing an unlocked read-modify-write.
+  if flock -w 2 8 2>/dev/null; then
+    _ecc_bump_signal_counter
+    flock -u 8 2>/dev/null || true
+  fi
+  exec 8>&- 2>/dev/null || true
 else
-  echo "1" > "$SIGNAL_COUNTER_FILE"
+  # No flock (e.g. macOS): atomic mkdir lock with a bounded spin so the hook
+  # never blocks indefinitely. A trap releases the lock on every exit path --
+  # including the async-timeout SIGTERM -- so a killed hook does not strand the
+  # directory. We deliberately do NOT hand-roll PID-based stale reclaim:
+  # re-verifying then removing another process's lock is racy and can delete a
+  # live re-acquirer's directory, reintroducing the very race this fixes.
+  _signal_lock_held=0
+  _signal_lock_spins=0
+  while [ "$_signal_lock_spins" -lt 100 ]; do
+    if mkdir "$SIGNAL_COUNTER_LOCK" 2>/dev/null; then
+      # EXIT cleans up on normal completion. INT/TERM must release AND exit:
+      # a signal trap that only released the lock would otherwise fall through
+      # and continue the read-modify-write without ownership.
+      trap 'rmdir "$SIGNAL_COUNTER_LOCK" 2>/dev/null || true' EXIT
+      trap 'rmdir "$SIGNAL_COUNTER_LOCK" 2>/dev/null || true; exit 130' INT
+      trap 'rmdir "$SIGNAL_COUNTER_LOCK" 2>/dev/null || true; exit 143' TERM
+      _signal_lock_held=1
+      break
+    fi
+    _signal_lock_spins=$((_signal_lock_spins + 1))
+    sleep 0.02
+  done
+  if [ "$_signal_lock_held" -eq 1 ]; then
+    # Bump only under the held lock -- never an unlocked read-modify-write.
+    _ecc_bump_signal_counter
+    rmdir "$SIGNAL_COUNTER_LOCK" 2>/dev/null || true
+    trap - EXIT INT TERM
+  fi
+  # If the lock could not be acquired within the spin budget we skip this tick
+  # rather than racing on an unlocked counter. Dropping one throttle tick under
+  # extreme contention only delays the next observer signal slightly; it never
+  # corrupts the counter or signals spuriously.
 fi
 
 # Signal observer if running and throttle allows (check both project-scoped and global observer, deduplicate)
@@ -443,7 +565,10 @@ if [ "$should_signal" -eq 1 ]; then
       observer_pid=$(cat "$pid_file" 2>/dev/null || true)
       # Validate PID is a positive integer (>1)
       case "$observer_pid" in
-        ''|*[!0-9]*|0|1) rm -f "$pid_file" 2>/dev/null || true; continue ;;
+        ''|*[!0-9]*|0|1)
+          _REMOVE_FILE_IF_PRESENT "$pid_file"
+          continue
+          ;;
       esac
       # Deduplicate: skip if already signaled this pass
       case "$signaled_pids" in

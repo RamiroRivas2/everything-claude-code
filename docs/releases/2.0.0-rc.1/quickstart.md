@@ -5,8 +5,8 @@ This path is for a new contributor who wants to verify the release surface befor
 ## Clone
 
 ```bash
-git clone https://github.com/affaan-m/everything-claude-code.git
-cd everything-claude-code
+git clone https://github.com/affaan-m/ECC.git
+cd ECC
 ```
 
 Start from a clean checkout. Do not copy private operator state, raw workspace exports, tokens, or local Hermes files into the repo.
@@ -19,6 +19,15 @@ npm ci
 
 This installs the Node-based validation and packaging toolchain used by the public release surface.
 
+To install the rc.1 package from npm instead of working from a checkout:
+
+```bash
+npm install ecc-universal@next
+```
+
+`next` currently resolves to `ecc-universal@2.0.0-rc.1`; `latest` remains on
+`1.10.0` during the release-candidate window.
+
 ## Verify
 
 ```bash
@@ -30,6 +39,15 @@ Expected result: every test passes with zero failures. For release-specific drif
 ```bash
 node tests/docs/ecc2-release-surface.test.js
 ```
+
+Then check the local observability surface:
+
+```bash
+npm run observability:ready
+```
+
+This runs the [observability readiness gate](../../architecture/observability-readiness.md)
+for loop status, session traces, harness audit, and ECC2 tool-risk logs.
 
 ## First Skill
 

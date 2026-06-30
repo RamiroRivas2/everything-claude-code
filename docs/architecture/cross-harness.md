@@ -13,6 +13,11 @@ The goal is to keep the durable parts of agentic work in one repo:
 
 Claude Code, Codex, OpenCode, Cursor, Gemini, and future harnesses should adapt those assets at the edge instead of requiring a new workflow model for every tool.
 
+For the operator-facing support matrix and scorecard workflow, see
+[Harness Adapter Compliance Matrix](harness-adapter-compliance.md).
+For the full-stack platform framing and product-integration loop, see
+[ECC Platform Value Loop](platform-value-loop.md).
+
 ## Portability Model
 
 | Surface | Shared Source | Harness Adapter | Current Status |
@@ -115,6 +120,8 @@ Still maturing:
 - release packaging for `ecc2/`
 - cross-harness session resume semantics
 - deeper memory and operator planning layers
+- the full platform loop where external products contribute skill packs,
+  gated APIs, evals, and case studies back into ECC
 
 ## Rule For New Work
 
